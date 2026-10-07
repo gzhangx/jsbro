@@ -8,6 +8,10 @@ those copies never turns. Roll the paper back up and the same line
 winds around the cone: it is a geodesic, straight along the surface
 and curved only because the surface itself has been rolled.
 
+Two windows open. The first is the unrolled sector beside the whole cone.
+The second follows the dot: the camera stays outside the cone, on the
+dot's side, and moves up and down with it.
+
 Run:
     python cone_wrap_demo.py
 """
@@ -80,7 +84,7 @@ def _style_3d(ax):
     ax.view_init(elev=24, azim=-62)
 
 
-def _draw_cone(ax, alpha):
+def _draw_cone(ax, alpha, fit="overview"):
     height = SLANT_LENGTH * np.cos(alpha)
     slant = np.linspace(0, SLANT_LENGTH, 50)
     phi = np.linspace(0, 2 * np.pi, 90)
@@ -126,11 +130,12 @@ def _draw_cone(ax, alpha):
     )
     ax.scatter([0], [0], [height], color=INK, s=18, zorder=4)
 
-    limit = SLANT_LENGTH * np.sin(alpha) * 1.35
-    ax.set_xlim(-limit, limit)
-    ax.set_ylim(-limit, limit)
-    ax.set_zlim(0, height * 1.08)
-    ax.set_box_aspect((2 * limit, 2 * limit, height * 1.08))
+    if fit == "overview":
+        limit = SLANT_LENGTH * np.sin(alpha) * 1.35
+        ax.set_xlim(-limit, limit)
+        ax.set_ylim(-limit, limit)
+        ax.set_zlim(0, height * 1.08)
+        ax.set_box_aspect((2 * limit, 2 * limit, height * 1.08))
 
 
 def _screen_angle(unrolled):
@@ -199,6 +204,44 @@ def _split_laps(lap_index):
     return ranges
 
 
+def _plot_path(ax, cone_x, cone_y, cone_z, lap, linewidth):
+    for start, stop, lap_id in _split_laps(lap):
+        color = LAP_COLORS[lap_id % len(LAP_COLORS)]
+        ax.plot(
+            cone_x[start:stop],
+            cone_y[start:stop],
+            cone_z[start:stop],
+            color=color,
+            lw=linewidth,
+            zorder=5,
+        )
+
+
+def _follow_camera(ax, alpha, cone_z, phi, frame):
+    """Keep the dot on the near side and crop the cone to its height."""
+    half_xy = SLANT_LENGTH * np.sin(alpha) * 1.7
+    half_z = 0.22
+    height = SLANT_LENGTH * np.cos(alpha)
+    z = float(cone_z[frame])
+    z_lo = z - half_z
+    z_hi = z + half_z
+    # Slide the crop instead of showing empty space past the base or the apex.
+    floor = -0.02
+    ceiling = height * 1.04
+    if z_lo < floor:
+        z_hi += floor - z_lo
+        z_lo = floor
+    if z_hi > ceiling:
+        z_lo -= z_hi - ceiling
+        z_hi = ceiling
+    ax.set_xlim(-half_xy, half_xy)
+    ax.set_ylim(-half_xy, half_xy)
+    ax.set_zlim(z_lo, z_hi)
+    ax.set_box_aspect((2 * half_xy, 2 * half_xy, z_hi - z_lo))
+    # Eye sits outside the cone, on the same bearing as the dot.
+    ax.view_init(elev=16, azim=np.rad2deg(phi[frame]))
+
+
 def build_demo():
     alpha, beta = cone_angles(SECTOR_COPIES)
     paper_x, paper_y = straight_line_on_paper(SLANT_LENGTH, LINE_OFFSET, SAMPLES)
@@ -222,6 +265,12 @@ def build_demo():
     ax_cone.set_facecolor(PAPER)
     _style_3d(ax_cone)
 
+    fig_follow = plt.figure(figsize=(7.4, 7.6), facecolor=PAPER)
+    ax_follow = fig_follow.add_subplot(111, projection="3d")
+    ax_follow.set_facecolor(PAPER)
+    _style_3d(ax_follow)
+    fig_follow.subplots_adjust(left=0.0, right=1.0, top=0.90, bottom=0.06)
+
     ax_paper.set_title(
         "Unrolled  ·  the path is one straight line",
         color=INK,
@@ -237,6 +286,9 @@ def build_demo():
 
     _draw_fan(ax_paper, beta, SLANT_LENGTH, SECTOR_COPIES)
     _draw_cone(ax_cone, alpha)
+    _draw_cone(ax_follow, alpha, fit="follow")
+    _plot_path(ax_cone, cone_x, cone_y, cone_z, lap, linewidth=2.8)
+    _plot_path(ax_follow, cone_x, cone_y, cone_z, lap, linewidth=3.4)
 
     for start, stop, lap_id in _split_laps(lap):
         color = LAP_COLORS[lap_id % len(LAP_COLORS)]
@@ -246,14 +298,6 @@ def build_demo():
             color=color,
             lw=3.2,
             solid_capstyle="round",
-            zorder=5,
-        )
-        ax_cone.plot(
-            cone_x[start:stop],
-            cone_y[start:stop],
-            cone_z[start:stop],
-            color=color,
-            lw=2.8,
             zorder=5,
         )
 
@@ -274,6 +318,23 @@ def build_demo():
         markeredgecolor="white",
         markeredgewidth=1.2,
         zorder=6,
+    )
+    follower_close, = ax_follow.plot(
+        [cone_x[0]], [cone_y[0]], [cone_z[0]],
+        "o",
+        ms=13,
+        color=LAP_COLORS[int(lap[0])],
+        markeredgecolor="white",
+        markeredgewidth=1.6,
+        zorder=6,
+    )
+    follow_note = fig_follow.text(
+        0.5, 0.025,
+        "",
+        ha="center",
+        va="center",
+        color=INK,
+        fontsize=11,
     )
 
     status = fig.text(
@@ -301,7 +362,11 @@ def build_demo():
         follower_cone.set_data([cone_x[frame]], [cone_y[frame]])
         follower_cone.set_3d_properties([cone_z[frame]])
         follower_cone.set_color(color)
+        follower_close.set_data([cone_x[frame]], [cone_y[frame]])
+        follower_close.set_3d_properties([cone_z[frame]])
+        follower_close.set_color(color)
         ax_cone.view_init(elev=24, azim=-62 + 18 * np.sin(2 * np.pi * frame / SAMPLES))
+        _follow_camera(ax_follow, alpha, cone_z, phi, frame)
         wound = np.rad2deg((unrolled[frame] - unrolled[0]) * (2 * np.pi / beta))
         status.set_text(
             f"following the line    "
@@ -309,7 +374,18 @@ def build_demo():
             f"loop {int(lap[frame]) + 1} of {SECTOR_COPIES}    "
             f"wound {wound:.0f}° around the cone"
         )
-        return follower_paper, follower_cone, status
+        ax_follow.set_title(
+            f"Following the dot  ·  loop {int(lap[frame]) + 1} of {SECTOR_COPIES}",
+            color=INK,
+            fontsize=13,
+            pad=10,
+        )
+        follow_note.set_text(
+            f"distance from apex  {slant[frame]:.2f}    "
+            f"wound {wound:.0f}° around the cone"
+        )
+        fig_follow.canvas.draw_idle()
+        return follower_paper, follower_cone, follower_close, status
 
     update(0)
     animation = FuncAnimation(
@@ -331,15 +407,16 @@ def build_demo():
         "cone": (cone_x, cone_y, cone_z),
         "phi": phi,
     }
-    return fig, update, geometry
+    return fig, fig_follow, update, geometry
 
 
 def main():
-    fig, _update, _geometry = build_demo()
-    try:
-        fig.canvas.manager.set_window_title("Unrolled cone")
-    except AttributeError:
-        pass
+    fig, fig_follow, _update, _geometry = build_demo()
+    for window, title in ((fig, "Unrolled cone"), (fig_follow, "Following the dot")):
+        try:
+            window.canvas.manager.set_window_title(title)
+        except AttributeError:
+            pass
     plt.show()
 
 
