@@ -1,423 +1,702 @@
 """
 A straight line on an unrolled cone wraps around the cone.
 
-A cone is a flat surface. Cut it along one seam and it unrolls into a
-circular sector. Lay copies of that sector side by side and you are
-looking at the cone's surface, repeated. A straight line drawn across
-those copies never turns. Roll the paper back up and the same line
-winds around the cone: it is a geodesic, straight along the surface
-and curved only because the surface itself has been rolled.
+The 3D views are OpenGL. The cone is a solid mesh with a depth buffer,
+so the surface covers the part of the line that winds behind it.
 
-Two windows open. The first is the unrolled sector beside the whole cone.
-The second follows the dot: the camera stays outside the cone, on the
-dot's side, and moves up and down with it.
+Two windows open. The first shows the unrolled sectors beside the cone.
+The second follows the dot. Drag either 3D view to turn it.
 
 Run:
     python cone_wrap_demo.py
 """
 
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-from matplotlib.patches import Wedge
+import pyglet
+from pyglet.gl import (
+    GL_COLOR_BUFFER_BIT,
+    GL_CULL_FACE,
+    GL_DEPTH_BUFFER_BIT,
+    GL_DEPTH_TEST,
+    GL_LEQUAL,
+    GL_SCISSOR_TEST,
+    GL_TRIANGLES,
+    Config,
+    glClear,
+    glClearColor,
+    glCullFace,
+    glDepthFunc,
+    glDisable,
+    glEnable,
+    glScissor,
+    glViewport,
+)
+from pyglet.graphics.shader import Shader, ShaderProgram
+from pyglet.math import Mat4, Vec3
+
+pyglet.options["shadow_window"] = False
 
 
-# Three copies fill a half-plane. One straight line can cross a half-plane
-# at most, so three is the most loops a single straight cut can show.
+# Three copies fill a half-plane. One straight line can cross at most that,
+# so three is the most loops a single straight cut can show.
 SECTOR_COPIES = 3
 SLANT_LENGTH = 1.0
-# Closest the line comes to the apex, measured along the paper.
-# Far enough from the tip that a full turn is a visible loop on the cone.
 LINE_OFFSET = 0.62
 SAMPLES = 480
+WALK_PER_SECOND = 36.0
 
-PAPER = "#f6f1e7"
-INK = "#241c14"
-SECTOR_COLORS = ("#f6d7a8", "#f3e4bc", "#e7d3a1")
-LAP_COLORS = ("#c4452e", "#1f7a45", "#2458a6")
-CONE_COLOR = "#e4c396"
+PAPER = (0.965, 0.945, 0.906, 1.0)
+INK = (0.141, 0.110, 0.078)
+SECTOR_COLORS = (
+    (0.965, 0.843, 0.659),
+    (0.953, 0.894, 0.737),
+    (0.906, 0.827, 0.631),
+)
+LAP_COLORS = (
+    (0.769, 0.271, 0.180),
+    (0.122, 0.478, 0.271),
+    (0.141, 0.345, 0.651),
+)
+CONE_COLOR = (0.894, 0.765, 0.588)
 
 
 def cone_angles(copies):
     """Sector angle and the cone's half-angle, for `copies` sectors in a half-plane."""
     beta = np.pi / copies
     # Arc of one sector equals the cone's base circumference: beta = 2 pi sin(alpha).
-    alpha = np.arcsin(beta / (2 * np.pi))
+    alpha = np.arcsin(beta / (2.0 * np.pi))
     return alpha, beta
 
 
 def straight_line_on_paper(length, offset, samples):
-    """Horizontal chord at distance `offset` from the apex, clipped to the sector radius."""
+    """Horizontal chord at distance `offset` from the apex, clipped to the rim."""
     half = np.sqrt(length**2 - offset**2)
-    # Travel from the right-hand rim, in toward the apex, and out to the left rim.
     abscissa = np.linspace(half, -half, samples)
-    x = abscissa
-    y = np.full_like(abscissa, offset)
-    return x, y
+    return abscissa, np.full_like(abscissa, offset)
 
 
 def map_to_cone(x, y, alpha, beta):
-    """Roll paper coordinates back onto the cone. Apex sits at the top."""
+    """Roll paper coordinates back onto the cone. The apex sits at the top."""
     slant = np.hypot(x, y)
     unrolled = np.arctan2(y, x)
     lap = np.floor(unrolled / beta).astype(int)
     local = unrolled - lap * beta
-    # Each sector occupies the full turn around the cone.
-    phi = local * (2 * np.pi / beta)
+    phi = local * (2.0 * np.pi / beta)
     radius = slant * np.sin(alpha)
     height = SLANT_LENGTH * np.cos(alpha)
-    # Nudge along the outward normal so the ink sits on the surface.
-    lift = 0.01
-    cone_x = radius * np.cos(phi) + lift * np.cos(alpha) * np.cos(phi)
-    cone_y = radius * np.sin(phi) + lift * np.cos(alpha) * np.sin(phi)
-    cone_z = height - slant * np.cos(alpha) + lift * np.sin(alpha)
+    cone_x = radius * np.cos(phi)
+    cone_y = radius * np.sin(phi)
+    cone_z = height - slant * np.cos(alpha)
     return cone_x, cone_y, cone_z, slant, unrolled, phi, lap
 
 
-def _style_3d(ax):
-    ax.set_proj_type("persp")
-    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
-        axis.pane.fill = False
-        axis.pane.set_edgecolor("#efe6d6")
-    ax.grid(False)
-    ax.set_axis_off()
-    ax.view_init(elev=24, azim=-62)
+def _surface_normal(phi, alpha):
+    return np.stack(
+        (
+            np.cos(alpha) * np.cos(phi),
+            np.cos(alpha) * np.sin(phi),
+            np.full_like(phi, np.sin(alpha)),
+        ),
+        axis=-1,
+    )
 
 
-def _draw_cone(ax, alpha, fit="overview"):
+def _cone_mesh(alpha, n_slant=48, n_phi=96):
+    """Triangle mesh of the cone. Outward faces are counter-clockwise."""
     height = SLANT_LENGTH * np.cos(alpha)
-    slant = np.linspace(0, SLANT_LENGTH, 50)
-    phi = np.linspace(0, 2 * np.pi, 90)
-    slant_grid, phi_grid = np.meshgrid(slant, phi)
-    radius = slant_grid * np.sin(alpha)
-    xs = radius * np.cos(phi_grid)
-    ys = radius * np.sin(phi_grid)
-    zs = height - slant_grid * np.cos(alpha)
-    ax.plot_surface(
-        xs, ys, zs,
-        color=CONE_COLOR,
-        alpha=0.55,
-        linewidth=0,
-        antialiased=True,
-        shade=True,
-        zorder=1,
-    )
+    slant = np.linspace(0.0, SLANT_LENGTH, n_slant)
+    phi = np.linspace(0.0, 2.0 * np.pi, n_phi, endpoint=False)
+    positions = []
+    normals = []
+    colors = []
+    cone = np.array(CONE_COLOR)
 
-    # Latitude rings make the slope readable on a slender cone.
-    ring_phi = np.linspace(0, 2 * np.pi, 180)
-    for level in (0.45, 0.7, 1.0):
-        ring_r = level * np.sin(alpha)
-        ax.plot(
-            ring_r * np.cos(ring_phi),
-            ring_r * np.sin(ring_phi),
-            np.full_like(ring_phi, height - level * np.cos(alpha)),
-            color="#8c6840",
-            lw=0.7,
-            alpha=0.7,
-            zorder=2,
+    def corner(s, p):
+        radius = s * np.sin(alpha)
+        return (
+            np.array([radius * np.cos(p), radius * np.sin(p), height - s * np.cos(alpha)]),
+            np.array([np.cos(alpha) * np.cos(p), np.cos(alpha) * np.sin(p), np.sin(alpha)]),
         )
 
-    # The seam that was cut. Every radial edge on the unrolled fan is this line.
-    seam_s = np.linspace(0, SLANT_LENGTH, 40)
-    ax.plot(
-        seam_s * np.sin(alpha),
-        np.zeros_like(seam_s),
-        height - seam_s * np.cos(alpha),
-        color=INK,
-        lw=1.6,
-        ls=(0, (2, 2)),
-        zorder=3,
-    )
-    ax.scatter([0], [0], [height], color=INK, s=18, zorder=4)
-
-    if fit == "overview":
-        limit = SLANT_LENGTH * np.sin(alpha) * 1.35
-        ax.set_xlim(-limit, limit)
-        ax.set_ylim(-limit, limit)
-        ax.set_zlim(0, height * 1.08)
-        ax.set_box_aspect((2 * limit, 2 * limit, height * 1.08))
-
-
-def _screen_angle(unrolled):
-    """Mirror the fan so the walk starts on the left and proceeds to the right."""
-    return np.pi - unrolled
+    ds = SLANT_LENGTH / (n_slant - 1)
+    dp = 2.0 * np.pi / n_phi
+    for i, s in enumerate(slant[:-1]):
+        for j, p in enumerate(phi):
+            p2 = p + dp
+            s2 = s + ds
+            c00, n00 = corner(s, p)
+            c01, n01 = corner(s, p2)
+            c11, n11 = corner(s2, p2)
+            c10, n10 = corner(s2, p)
+            # p00, p01, p11, p00, p11, p10 — CCW when seen from outside.
+            for vertex, normal in (
+                (c00, n00), (c01, n01), (c11, n11),
+                (c00, n00), (c11, n11), (c10, n10),
+            ):
+                positions.extend(vertex.tolist())
+                normals.extend(normal.tolist())
+                colors.extend(cone.tolist())
+    return positions, normals, colors
 
 
-def _draw_fan(ax, beta, length, laps):
-    for lap in range(laps):
-        # Screen angle runs backwards, so the first loop lands on the left.
-        start = _screen_angle((lap + 1) * beta)
-        stop = _screen_angle(lap * beta)
-        wedge = Wedge(
-            (0, 0),
-            length,
-            np.rad2deg(start),
-            np.rad2deg(stop),
-            facecolor=SECTOR_COLORS[lap],
-            edgecolor="#6b542c",
-            linewidth=1.1,
-            alpha=0.95,
-            zorder=1,
+def _ribbon(points, normals, colors, half_width):
+    """A strip lying on the surface, proud of it by the normals' own length."""
+    count = len(points)
+    left = np.empty((count, 3))
+    right = np.empty((count, 3))
+    for i in range(count):
+        if i == 0:
+            tangent = points[1] - points[0]
+        elif i == count - 1:
+            tangent = points[-1] - points[-2]
+        else:
+            tangent = points[i + 1] - points[i - 1]
+        tangent = tangent / (np.linalg.norm(tangent) + 1e-12)
+        side = np.cross(normals[i], tangent)
+        side = side / (np.linalg.norm(side) + 1e-12)
+        center = points[i] + normals[i]
+        left[i] = center + side * half_width
+        right[i] = center - side * half_width
+
+    positions, out_normals, out_colors = [], [], []
+    for i in range(count - 1):
+        quad = (left[i], left[i + 1], right[i + 1], left[i], right[i + 1], right[i])
+        normal_pair = (normals[i], normals[i + 1], normals[i + 1], normals[i], normals[i + 1], normals[i])
+        color_pair = (colors[i], colors[i + 1], colors[i + 1], colors[i], colors[i + 1], colors[i])
+        for vertex, normal, color in zip(quad, normal_pair, color_pair):
+            positions.extend(vertex.tolist())
+            out_normals.extend(normal.tolist())
+            out_colors.extend(color.tolist())
+    return positions, out_normals, out_colors
+
+
+def _disk(radius, segments, z=0.0):
+    positions, normals, colors = [], [], []
+    normal = (0.0, 0.0, 1.0)
+    color = (1.0, 1.0, 1.0)
+    for i in range(segments):
+        a0 = 2.0 * np.pi * i / segments
+        a1 = 2.0 * np.pi * (i + 1) / segments
+        tri = (
+            (0.0, 0.0, z),
+            (radius * np.cos(a0), radius * np.sin(a0), z),
+            (radius * np.cos(a1), radius * np.sin(a1), z),
         )
-        ax.add_patch(wedge)
-        mid = _screen_angle((lap + 0.5) * beta)
-        # Low in each sector, clear of the chord and of the moving dot.
-        ax.text(
-            0.38 * length * np.cos(mid),
-            0.38 * length * np.sin(mid),
-            f"loop {lap + 1}",
-            ha="center",
-            va="center",
-            color=LAP_COLORS[lap],
-            fontsize=11,
-            fontweight="medium",
-            zorder=2,
+        for vertex in tri:
+            positions.extend(vertex)
+            normals.extend(normal)
+            colors.extend(color)
+    return positions, normals, colors
+
+
+def _fan_mesh(beta, length, copies):
+    positions, normals, colors = [], [], []
+    steps = 24
+    for lap in range(copies):
+        color = SECTOR_COLORS[lap]
+        a0 = np.pi - (lap + 1) * beta
+        a1 = np.pi - lap * beta
+        angles = np.linspace(a0, a1, steps)
+        for i in range(steps - 1):
+            tri = (
+                (0.0, 0.0, 0.0),
+                (length * np.cos(angles[i]), length * np.sin(angles[i]), 0.0),
+                (length * np.cos(angles[i + 1]), length * np.sin(angles[i + 1]), 0.0),
+            )
+            for vertex in tri:
+                positions.extend(vertex)
+                normals.extend((0.0, 0.0, 1.0))
+                colors.extend(color)
+    return positions, normals, colors
+
+
+def _paper_ribbon(x, y, lap, half_width):
+    """Screen x is mirrored so the walk reads left to right."""
+    points = np.stack((-x, y, np.zeros_like(x)), axis=1)
+    count = len(points)
+    positions, normals, colors = [], [], []
+    for i in range(count - 1):
+        color = LAP_COLORS[int(lap[i]) % len(LAP_COLORS)]
+        y0 = points[i, 1]
+        y1 = points[i + 1, 1]
+        x0 = points[i, 0]
+        x1 = points[i + 1, 0]
+        quad = (
+            (x0, y0 + half_width, 0.0),
+            (x1, y1 + half_width, 0.0),
+            (x1, y1 - half_width, 0.0),
+            (x0, y0 + half_width, 0.0),
+            (x1, y1 - half_width, 0.0),
+            (x0, y0 - half_width, 0.0),
         )
-
-    ax.plot(0, 0, "o", color=INK, ms=5, zorder=4)
-    ax.annotate(
-        "apex",
-        (0, 0),
-        textcoords="offset points",
-        xytext=(8, -14),
-        color=INK,
-        fontsize=10,
-    )
-    ax.set_aspect("equal")
-    ax.set_xlim(-1.18 * length, 1.18 * length)
-    ax.set_ylim(-0.28 * length, 1.18 * length)
-    ax.axis("off")
+        for vertex in quad:
+            positions.extend(vertex)
+            normals.extend((0.0, 0.0, 1.0))
+            colors.extend(color)
+    return positions, normals, colors
 
 
-def _split_laps(lap_index):
-    """Index ranges for each contiguous run of one sector copy."""
-    if len(lap_index) == 0:
-        return []
-    cuts = np.where(np.diff(lap_index) != 0)[0] + 1
-    ranges = []
-    start = 0
-    for cut in list(cuts) + [len(lap_index)]:
-        # Keep the shared endpoint so colored pieces meet.
-        stop = min(len(lap_index), cut + (0 if cut == len(lap_index) else 1))
-        ranges.append((start, stop, int(lap_index[start])))
-        start = cut
-    return ranges
+def _path_ribbon(cone, phi, lap, alpha, half_width, lift):
+    points = np.stack(cone, axis=1)
+    normals = _surface_normal(phi, alpha) * lift
+    colors = np.array([LAP_COLORS[int(k) % len(LAP_COLORS)] for k in lap])
+    return _ribbon(points, normals, colors, half_width)
 
 
-def _plot_path(ax, cone_x, cone_y, cone_z, lap, linewidth):
-    for start, stop, lap_id in _split_laps(lap):
-        color = LAP_COLORS[lap_id % len(LAP_COLORS)]
-        ax.plot(
-            cone_x[start:stop],
-            cone_y[start:stop],
-            cone_z[start:stop],
-            color=color,
-            lw=linewidth,
-            zorder=5,
-        )
+VERTEX_SRC = """#version 330 core
+in vec3 position;
+in vec3 normal;
+in vec3 color;
 
+uniform mat4 u_mvp;
+uniform mat4 u_model;
 
-def _follow_camera(ax, alpha, cone_z, phi, frame):
-    """Keep the dot on the near side and crop the cone to its height."""
-    half_xy = SLANT_LENGTH * np.sin(alpha) * 1.7
-    half_z = 0.22
-    height = SLANT_LENGTH * np.cos(alpha)
-    z = float(cone_z[frame])
-    z_lo = z - half_z
-    z_hi = z + half_z
-    # Slide the crop instead of showing empty space past the base or the apex.
-    floor = -0.02
-    ceiling = height * 1.04
-    if z_lo < floor:
-        z_hi += floor - z_lo
-        z_lo = floor
-    if z_hi > ceiling:
-        z_lo -= z_hi - ceiling
-        z_hi = ceiling
-    ax.set_xlim(-half_xy, half_xy)
-    ax.set_ylim(-half_xy, half_xy)
-    ax.set_zlim(z_lo, z_hi)
-    ax.set_box_aspect((2 * half_xy, 2 * half_xy, z_hi - z_lo))
-    # Eye sits outside the cone, on the same bearing as the dot.
-    ax.view_init(elev=16, azim=np.rad2deg(phi[frame]))
+out vec3 v_normal;
+out vec3 v_color;
+out vec3 v_world;
 
+void main() {
+    vec4 world = u_model * vec4(position, 1.0);
+    v_world = world.xyz;
+    v_normal = mat3(u_model) * normal;
+    v_color = color;
+    gl_Position = u_mvp * world;
+}
+"""
 
-def build_demo():
-    alpha, beta = cone_angles(SECTOR_COPIES)
-    paper_x, paper_y = straight_line_on_paper(SLANT_LENGTH, LINE_OFFSET, SAMPLES)
-    cone_x, cone_y, cone_z, slant, unrolled, phi, lap = map_to_cone(
-        paper_x, paper_y, alpha, beta
-    )
+FRAGMENT_SRC = """#version 330 core
+in vec3 v_normal;
+in vec3 v_color;
+in vec3 v_world;
 
-    fig = plt.figure(figsize=(13.4, 7.3), facecolor=PAPER)
-    fig.suptitle(
-        "A straight line on the unrolled cone wraps around the cone",
-        fontsize=16,
-        color=INK,
-        y=0.97,
-    )
-    grid = fig.add_gridspec(
-        1, 2, left=0.03, right=0.985, top=0.86, bottom=0.13, wspace=0.06
-    )
-    ax_paper = fig.add_subplot(grid[0, 0])
-    ax_cone = fig.add_subplot(grid[0, 1], projection="3d")
-    ax_paper.set_facecolor(PAPER)
-    ax_cone.set_facecolor(PAPER)
-    _style_3d(ax_cone)
+uniform vec3 u_light;
+uniform vec3 u_camera;
+uniform float u_lit;
 
-    fig_follow = plt.figure(figsize=(7.4, 7.6), facecolor=PAPER)
-    ax_follow = fig_follow.add_subplot(111, projection="3d")
-    ax_follow.set_facecolor(PAPER)
-    _style_3d(ax_follow)
-    fig_follow.subplots_adjust(left=0.0, right=1.0, top=0.90, bottom=0.06)
+out vec4 frag_color;
 
-    ax_paper.set_title(
-        "Unrolled  ·  the path is one straight line",
-        color=INK,
-        fontsize=12,
-        pad=8,
-    )
-    ax_cone.set_title(
-        "Rolled back up  ·  the same path winds around",
-        color=INK,
-        fontsize=12,
-        pad=8,
-    )
-
-    _draw_fan(ax_paper, beta, SLANT_LENGTH, SECTOR_COPIES)
-    _draw_cone(ax_cone, alpha)
-    _draw_cone(ax_follow, alpha, fit="follow")
-    _plot_path(ax_cone, cone_x, cone_y, cone_z, lap, linewidth=2.8)
-    _plot_path(ax_follow, cone_x, cone_y, cone_z, lap, linewidth=3.4)
-
-    for start, stop, lap_id in _split_laps(lap):
-        color = LAP_COLORS[lap_id % len(LAP_COLORS)]
-        ax_paper.plot(
-            -paper_x[start:stop],
-            paper_y[start:stop],
-            color=color,
-            lw=3.2,
-            solid_capstyle="round",
-            zorder=5,
-        )
-
-    follower_paper, = ax_paper.plot(
-        [-paper_x[0]], [paper_y[0]],
-        "o",
-        ms=11,
-        color=LAP_COLORS[int(lap[0])],
-        markeredgecolor="white",
-        markeredgewidth=1.6,
-        zorder=6,
-    )
-    follower_cone, = ax_cone.plot(
-        [cone_x[0]], [cone_y[0]], [cone_z[0]],
-        "o",
-        ms=9,
-        color=LAP_COLORS[int(lap[0])],
-        markeredgecolor="white",
-        markeredgewidth=1.2,
-        zorder=6,
-    )
-    follower_close, = ax_follow.plot(
-        [cone_x[0]], [cone_y[0]], [cone_z[0]],
-        "o",
-        ms=13,
-        color=LAP_COLORS[int(lap[0])],
-        markeredgecolor="white",
-        markeredgewidth=1.6,
-        zorder=6,
-    )
-    follow_note = fig_follow.text(
-        0.5, 0.025,
-        "",
-        ha="center",
-        va="center",
-        color=INK,
-        fontsize=11,
-    )
-
-    status = fig.text(
-        0.5, 0.055,
-        "",
-        ha="center",
-        va="center",
-        color=INK,
-        fontsize=11,
-    )
-    fig.text(
-        0.5, 0.018,
-        "Cut the cone along the dashed seam and lay the copies flat. "
-        "The ink never bends. Each color is one more trip around the seam.",
-        ha="center",
-        va="center",
-        color="#5c5146",
-        fontsize=10,
-    )
-
-    def update(frame):
-        color = LAP_COLORS[int(lap[frame]) % len(LAP_COLORS)]
-        follower_paper.set_data([-paper_x[frame]], [paper_y[frame]])
-        follower_paper.set_color(color)
-        follower_cone.set_data([cone_x[frame]], [cone_y[frame]])
-        follower_cone.set_3d_properties([cone_z[frame]])
-        follower_cone.set_color(color)
-        follower_close.set_data([cone_x[frame]], [cone_y[frame]])
-        follower_close.set_3d_properties([cone_z[frame]])
-        follower_close.set_color(color)
-        ax_cone.view_init(elev=24, azim=-62 + 18 * np.sin(2 * np.pi * frame / SAMPLES))
-        _follow_camera(ax_follow, alpha, cone_z, phi, frame)
-        wound = np.rad2deg((unrolled[frame] - unrolled[0]) * (2 * np.pi / beta))
-        status.set_text(
-            f"following the line    "
-            f"distance from apex  {slant[frame]:.2f}    "
-            f"loop {int(lap[frame]) + 1} of {SECTOR_COPIES}    "
-            f"wound {wound:.0f}° around the cone"
-        )
-        ax_follow.set_title(
-            f"Following the dot  ·  loop {int(lap[frame]) + 1} of {SECTOR_COPIES}",
-            color=INK,
-            fontsize=13,
-            pad=10,
-        )
-        follow_note.set_text(
-            f"distance from apex  {slant[frame]:.2f}    "
-            f"wound {wound:.0f}° around the cone"
-        )
-        fig_follow.canvas.draw_idle()
-        return follower_paper, follower_cone, follower_close, status
-
-    update(0)
-    animation = FuncAnimation(
-        fig,
-        update,
-        frames=SAMPLES,
-        interval=25,
-        blit=False,
-        repeat=True,
-    )
-    # Keep the animation alive for as long as the figure is.
-    fig._cone_animation = animation
-
-    geometry = {
-        "alpha_deg": float(np.rad2deg(alpha)),
-        "sector_deg": float(np.rad2deg(beta)),
-        "laps": lap,
-        "paper": (paper_x, paper_y),
-        "cone": (cone_x, cone_y, cone_z),
-        "phi": phi,
+void main() {
+    vec3 color = v_color;
+    if (u_lit > 0.5) {
+        vec3 n = normalize(v_normal);
+        vec3 light = normalize(u_light);
+        float diffuse = max(dot(n, light), 0.0);
+        vec3 view = normalize(u_camera - v_world);
+        vec3 half_dir = normalize(light + view);
+        float spec = pow(max(dot(n, half_dir), 0.0), 28.0);
+        color = color * (0.38 + 0.72 * diffuse) + vec3(spec * 0.18);
     }
-    return fig, fig_follow, update, geometry
+    frag_color = vec4(color, 1.0);
+}
+"""
+
+
+def _upload(program, positions, normals, colors):
+    count = len(positions) // 3
+    return program.vertex_list(
+        count,
+        GL_TRIANGLES,
+        position=("f", positions),
+        normal=("f", normals),
+        color=("f", colors),
+    )
+
+
+class Renderer:
+    """GPU meshes for one OpenGL context."""
+
+    def __init__(self, geometry):
+        self.geometry = geometry
+        self.program = None
+        self.meshes = {}
+
+    def build(self):
+        if self.program is not None:
+            return
+        self.program = ShaderProgram(
+            Shader(VERTEX_SRC, "vertex"),
+            Shader(FRAGMENT_SRC, "fragment"),
+        )
+        g = self.geometry
+        self.meshes = {
+            "cone": _upload(self.program, *g["cone"]),
+            "path": _upload(self.program, *g["path"]),
+            "seam": _upload(self.program, *g["seam"]),
+            "fan": _upload(self.program, *g["fan"]),
+            "paper": _upload(self.program, *g["paper"]),
+            "dot": _upload(self.program, *_sphere(0.018, 10, 14)),
+            "paper_dot": _upload(self.program, *_disk(0.045, 20, 0.02)),
+        }
+        self.program["u_light"] = (0.35, -0.55, 0.76)
+        self.program["u_model"] = Mat4()
+
+    def draw(self, name, mvp, camera, lit, model=None):
+        self.program["u_mvp"] = mvp
+        self.program["u_model"] = Mat4() if model is None else model
+        self.program["u_camera"] = camera
+        self.program["u_lit"] = float(lit)
+        self.program.use()
+        self.meshes[name].draw(GL_TRIANGLES)
+
+
+def _sphere(radius, stacks, slices):
+    positions, normals, colors = [], [], []
+    color = (1.0, 1.0, 1.0)
+    for i in range(stacks):
+        v0 = np.pi * i / stacks
+        v1 = np.pi * (i + 1) / stacks
+        for j in range(slices):
+            u0 = 2.0 * np.pi * j / slices
+            u1 = 2.0 * np.pi * (j + 1) / slices
+
+            def vertex(u, v):
+                n = np.array([
+                    np.sin(v) * np.cos(u),
+                    np.sin(v) * np.sin(u),
+                    np.cos(v),
+                ])
+                return n * radius, n
+
+            a, na = vertex(u0, v0)
+            b, nb = vertex(u1, v0)
+            c, nc = vertex(u1, v1)
+            d, nd = vertex(u0, v1)
+            for point, normal in ((a, na), (b, nb), (c, nc), (a, na), (c, nc), (d, nd)):
+                positions.extend(point.tolist())
+                normals.extend(normal.tolist())
+                colors.extend(color)
+    return positions, normals, colors
+
+
+def _translate(x, y, z):
+    return Mat4.from_translation(Vec3(float(x), float(y), float(z)))
+
+
+def _look(eye, target):
+    return Mat4.look_at(Vec3(*eye), Vec3(*target), Vec3(0.0, 0.0, 1.0))
+
+
+class Demo:
+    def __init__(self):
+        alpha, beta = cone_angles(SECTOR_COPIES)
+        paper_x, paper_y = straight_line_on_paper(SLANT_LENGTH, LINE_OFFSET, SAMPLES)
+        cone_x, cone_y, cone_z, slant, unrolled, phi, lap = map_to_cone(
+            paper_x, paper_y, alpha, beta
+        )
+        height = SLANT_LENGTH * np.cos(alpha)
+        path = _path_ribbon((cone_x, cone_y, cone_z), phi, lap, alpha, 0.0075, 0.0045)
+        seam_phi = np.linspace(0.0, 0.0, 2)
+        seam_s = np.array([0.0, SLANT_LENGTH])
+        seam_pts = np.stack(
+            (
+                seam_s * np.sin(alpha),
+                np.zeros(2),
+                height - seam_s * np.cos(alpha),
+            ),
+            axis=1,
+        )
+        seam_n = np.repeat(_surface_normal(np.array([0.0]), alpha), 2, axis=0) * 0.0025
+        seam = _ribbon(
+            seam_pts,
+            seam_n,
+            np.tile(INK, (2, 1)),
+            0.0035,
+        )
+        geometry = {
+            "cone": _cone_mesh(alpha),
+            "path": path,
+            "seam": seam,
+            "fan": _fan_mesh(beta, SLANT_LENGTH, SECTOR_COPIES),
+            "paper": _paper_ribbon(paper_x, paper_y, lap, 0.018),
+        }
+        self.alpha = alpha
+        self.height = height
+        self.paper = np.stack((-paper_x, paper_y, np.zeros_like(paper_x)), axis=1)
+        self.cone = np.stack((cone_x, cone_y, cone_z), axis=1)
+        self.phi = phi
+        self.slant = slant
+        self.unrolled = unrolled
+        self.lap = lap
+        self.beta = beta
+        self.cursor = 0.0
+        self.paused = False
+        self.yaw = np.deg2rad(-62.0)
+        self.pitch = np.deg2rad(24.0)
+        self.distance = 2.35
+        self.follow_orbit = None
+        self.dragging = None
+
+        config = Config(depth_size=24, double_buffer=True, major_version=3, minor_version=3)
+        self.main = pyglet.window.Window(
+            1360, 760, caption="Unrolled cone", resizable=True, config=config,
+        )
+        self.follow = pyglet.window.Window(
+            760, 760, caption="Following the dot", resizable=True, config=config,
+        )
+        ink = tuple(int(c * 255) for c in INK) + (255,)
+        muted = (92, 81, 70, 255)
+        self.main.switch_to()
+        self.gpu_main = Renderer(geometry)
+        self.gpu_main.build()
+        self.main_labels = {
+            "title": pyglet.text.Label(
+                "A straight line on the unrolled cone wraps around the cone",
+                font_size=15, color=ink, anchor_x="center", anchor_y="top",
+            ),
+            "paper": pyglet.text.Label(
+                "Unrolled  ·  the path is one straight line",
+                font_size=12, color=ink, anchor_x="center", anchor_y="top",
+            ),
+            "cone": pyglet.text.Label(
+                "Rolled back up  ·  the cone covers the far side",
+                font_size=12, color=ink, anchor_x="center", anchor_y="top",
+            ),
+            "hint": pyglet.text.Label(
+                "Drag the cone to turn it.  The surface hides the line behind it.",
+                font_size=11, color=muted, anchor_x="center", anchor_y="bottom",
+            ),
+            "status": pyglet.text.Label(
+                "", font_size=12, color=ink, anchor_x="center", anchor_y="bottom",
+            ),
+        }
+        self.follow.switch_to()
+        self.gpu_follow = Renderer(geometry)
+        self.gpu_follow.build()
+        self.follow_labels = {
+            "title": pyglet.text.Label(
+                "", font_size=14, color=ink, anchor_x="center", anchor_y="top",
+            ),
+            "status": pyglet.text.Label(
+                "", font_size=12, color=ink, anchor_x="center", anchor_y="bottom",
+            ),
+        }
+        self._bind()
+
+    def _bind(self):
+        demo = self
+
+        @self.main.event
+        def on_draw():
+            demo.draw_main()
+
+        @self.follow.event
+        def on_draw():
+            demo.draw_follow()
+
+        @self.main.event
+        def on_mouse_press(x, y, button, modifiers):
+            if x >= demo.main.width * 0.5:
+                demo.dragging = "main"
+
+        @self.main.event
+        def on_mouse_release(x, y, button, modifiers):
+            demo.dragging = None
+
+        @self.main.event
+        def on_mouse_drag(x, y, dx, dy, buttons, modifiers):
+            if demo.dragging == "main":
+                demo.yaw += dx * 0.008
+                demo.pitch = float(np.clip(demo.pitch + dy * 0.006, -1.2, 1.2))
+
+        @self.main.event
+        def on_mouse_scroll(x, y, scroll_x, scroll_y):
+            if x >= demo.main.width * 0.5:
+                demo.distance = float(np.clip(demo.distance - scroll_y * 0.12, 1.2, 5.0))
+
+        @self.follow.event
+        def on_mouse_press(x, y, button, modifiers):
+            demo.dragging = "follow"
+            if demo.follow_orbit is None:
+                demo.follow_orbit = [0.0, 0.0]
+
+        @self.follow.event
+        def on_mouse_release(x, y, button, modifiers):
+            demo.dragging = None
+            demo.follow_orbit = None
+
+        @self.follow.event
+        def on_mouse_drag(x, y, dx, dy, buttons, modifiers):
+            if demo.follow_orbit is not None:
+                demo.follow_orbit[0] += dx * 0.008
+                demo.follow_orbit[1] = float(np.clip(
+                    demo.follow_orbit[1] + dy * 0.006, -0.8, 0.8
+                ))
+
+        @self.main.event
+        def on_close():
+            pyglet.app.exit()
+
+        @self.follow.event
+        def on_close():
+            pyglet.app.exit()
+
+        @self.main.event
+        def on_key_press(symbol, modifiers):
+            demo._key(symbol)
+
+        @self.follow.event
+        def on_key_press(symbol, modifiers):
+            demo._key(symbol)
+
+    def _key(self, symbol):
+        if symbol == pyglet.window.key.ESCAPE:
+            pyglet.app.exit()
+        elif symbol == pyglet.window.key.SPACE:
+            self.paused = not self.paused
+
+    def advance(self, dt):
+        if not self.paused:
+            self.cursor = (self.cursor + dt * WALK_PER_SECOND) % SAMPLES
+
+    @property
+    def frame(self):
+        return int(self.cursor) % SAMPLES
+
+    def _status(self):
+        i = self.frame
+        wound = np.rad2deg((self.unrolled[i] - self.unrolled[0]) * (2.0 * np.pi / self.beta))
+        return (
+            f"distance from apex  {self.slant[i]:.2f}     "
+            f"loop {int(self.lap[i]) + 1} of {SECTOR_COPIES}     "
+            f"wound {wound:.0f}° around the cone"
+        )
+
+    def _overview_eye(self):
+        target = np.array([0.0, 0.0, self.height * 0.42])
+        eye = target + self.distance * np.array([
+            np.cos(self.pitch) * np.cos(self.yaw),
+            np.cos(self.pitch) * np.sin(self.yaw),
+            np.sin(self.pitch),
+        ])
+        return eye, target
+
+    def _follow_eye(self):
+        i = self.frame
+        pos = self.cone[i]
+        phi = self.phi[i]
+        normal = _surface_normal(np.array([phi]), self.alpha)[0]
+        eye = pos + normal * 0.48 + np.array([0.0, 0.0, 0.06])
+        target = pos * 0.35 + np.array([0.0, 0.0, pos[2]])
+        if self.follow_orbit is not None:
+            yaw, pitch = self.follow_orbit
+            offset = eye - target
+            turned = np.array([
+                offset[0] * np.cos(yaw) - offset[1] * np.sin(yaw),
+                offset[0] * np.sin(yaw) + offset[1] * np.cos(yaw),
+                offset[2],
+            ])
+            flat = np.array([turned[0], turned[1], 0.0])
+            flat_n = np.linalg.norm(flat) + 1e-12
+            eye = target + turned + flat / flat_n * 0.0
+            eye = target + np.array([
+                turned[0],
+                turned[1],
+                turned[2] + pitch * 0.25,
+            ])
+        return eye, target
+
+    def _paint_3d(self, gpu, eye, target, aspect):
+        glEnable(GL_DEPTH_TEST)
+        glDepthFunc(GL_LEQUAL)
+        glEnable(GL_CULL_FACE)
+        glCullFace(0x0405)  # GL_BACK
+        proj = Mat4.perspective_projection(aspect, 0.02, 40.0, fov=34.0)
+        view = _look(eye, target)
+        mvp = proj @ view
+        camera = (float(eye[0]), float(eye[1]), float(eye[2]))
+        gpu.draw("cone", mvp, camera, lit=1.0)
+        glDisable(GL_CULL_FACE)
+        gpu.draw("seam", mvp, camera, lit=0.0)
+        gpu.draw("path", mvp, camera, lit=0.0)
+        i = self.frame
+        pos = self.cone[i]
+        normal = _surface_normal(np.array([self.phi[i]]), self.alpha)[0]
+        dot = pos + normal * 0.02
+        color = LAP_COLORS[int(self.lap[i]) % len(LAP_COLORS)]
+        gpu.meshes["dot"].color[:] = np.tile(color, len(gpu.meshes["dot"].color) // 3)
+        gpu.draw("dot", mvp, camera, lit=1.0, model=_translate(*dot))
+
+    def _begin(self, window, gpu):
+        window.switch_to()
+        gpu.build()
+        glClearColor(*PAPER)
+        fb_w, fb_h = window.get_framebuffer_size()
+        glViewport(0, 0, fb_w, fb_h)
+        glDisable(GL_SCISSOR_TEST)
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        return fb_w, fb_h
+
+    def draw_main(self):
+        fb_w, fb_h = self._begin(self.main, self.gpu_main)
+        split = int(fb_w * 0.50)
+        glEnable(GL_SCISSOR_TEST)
+
+        glViewport(0, 0, split, fb_h)
+        glScissor(0, 0, split, fb_h)
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_CULL_FACE)
+        ortho = Mat4.orthogonal_projection(-1.35, 1.35, -0.42, 1.28, -1.0, 1.0)
+        camera = (0.0, 0.0, 1.0)
+        self.gpu_main.draw("fan", ortho, camera, lit=0.0)
+        self.gpu_main.draw("paper", ortho, camera, lit=0.0)
+        i = self.frame
+        color = LAP_COLORS[int(self.lap[i]) % len(LAP_COLORS)]
+        self.gpu_main.meshes["paper_dot"].color[:] = np.tile(
+            color, len(self.gpu_main.meshes["paper_dot"].color) // 3
+        )
+        self.gpu_main.draw(
+            "paper_dot", ortho, camera, lit=0.0, model=_translate(*self.paper[i]),
+        )
+
+        glViewport(split, 0, fb_w - split, fb_h)
+        glScissor(split, 0, fb_w - split, fb_h)
+        glClear(GL_DEPTH_BUFFER_BIT)
+        eye, target = self._overview_eye()
+        aspect = max(fb_w - split, 1) / max(fb_h, 1)
+        self._paint_3d(self.gpu_main, eye, target, aspect)
+
+        glDisable(GL_SCISSOR_TEST)
+        w, h = self.main.get_size()
+        labels = self.main_labels
+        labels["title"].x = w * 0.5
+        labels["title"].y = h - 12
+        labels["paper"].x = w * 0.25
+        labels["paper"].y = h - 46
+        labels["cone"].x = w * 0.75
+        labels["cone"].y = h - 46
+        labels["status"].x = w * 0.5
+        labels["status"].y = 36
+        labels["status"].text = self._status()
+        labels["hint"].x = w * 0.5
+        labels["hint"].y = 12
+        for name in ("title", "paper", "cone", "status", "hint"):
+            labels[name].draw()
+
+    def draw_follow(self):
+        fb_w, fb_h = self._begin(self.follow, self.gpu_follow)
+        eye, target = self._follow_eye()
+        self._paint_3d(self.gpu_follow, eye, target, max(fb_w, 1) / max(fb_h, 1))
+        w, h = self.follow.get_size()
+        i = self.frame
+        labels = self.follow_labels
+        labels["title"].x = w * 0.5
+        labels["title"].y = h - 16
+        labels["title"].text = (
+            f"Following the dot  ·  loop {int(self.lap[i]) + 1} of {SECTOR_COPIES}"
+        )
+        labels["status"].x = w * 0.5
+        labels["status"].y = 16
+        labels["status"].text = self._status()
+        labels["title"].draw()
+        labels["status"].draw()
+
+    def run(self):
+        pyglet.clock.schedule_interval(lambda dt: self.advance(dt), 1.0 / 60.0)
+        pyglet.app.run()
 
 
 def main():
-    fig, fig_follow, _update, _geometry = build_demo()
-    for window, title in ((fig, "Unrolled cone"), (fig_follow, "Following the dot")):
-        try:
-            window.canvas.manager.set_window_title(title)
-        except AttributeError:
-            pass
-    plt.show()
+    Demo().run()
 
 
 if __name__ == "__main__":
