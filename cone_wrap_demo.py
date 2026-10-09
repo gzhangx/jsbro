@@ -386,8 +386,17 @@ def _translate(x, y, z):
     return Mat4.from_translation(Vec3(float(x), float(y), float(z)))
 
 
-def _look(eye, target):
-    return Mat4.look_at(Vec3(*eye), Vec3(*target), Vec3(0.0, 0.0, 1.0))
+def _look(eye, target, up=(0.0, 0.0, 1.0)):
+    return Mat4.look_at(Vec3(*eye), Vec3(*target), Vec3(*up))
+
+
+def _rotate(vector, axis, angle):
+    axis = axis / (np.linalg.norm(axis) + 1e-12)
+    return (
+        vector * np.cos(angle)
+        + np.cross(axis, vector) * np.sin(angle)
+        + axis * np.dot(axis, vector) * (1.0 - np.cos(angle))
+    )
 
 
 class Demo:
@@ -585,32 +594,33 @@ class Demo:
         return eye, target
 
     def _follow_eye(self):
+        """Sit just behind the dot and look along the direction it is walking."""
         i = self.frame
         pos = self.cone[i]
-        phi = float(self.phi[i])
-        target = np.array([0.0, 0.0, float(pos[2])])
-        outward = np.array([np.cos(phi), np.sin(phi), 0.0])
+        ahead = min(i + 4, len(self.cone) - 1)
+        behind = max(i - 4, 0)
+        forward = self.cone[ahead] - self.cone[behind]
+        length = np.linalg.norm(forward)
+        if length < 1e-8:
+            forward = np.array([1.0, 0.0, 0.0])
+        else:
+            forward = forward / length
+        normal = _surface_normal(np.array([float(self.phi[i])]), self.alpha)[0]
         if self.follow_orbit is not None:
             yaw, pitch = self.follow_orbit
-            c, s = np.cos(yaw), np.sin(yaw)
-            outward = np.array([
-                outward[0] * c - outward[1] * s,
-                outward[0] * s + outward[1] * c,
-                0.0,
-            ])
-            lift = 0.22 + pitch * 0.35
-        else:
-            lift = 0.22
-        eye = target + outward * 0.95 + np.array([0.0, 0.0, lift])
-        return eye, target
+            forward = _rotate(forward, normal, yaw)
+            normal = _rotate(normal, forward, -pitch)
+        eye = pos - forward * 0.28 + normal * 0.05
+        target = pos + forward * 0.45
+        return eye, target, normal
 
-    def _paint_3d(self, gpu, eye, target, aspect):
+    def _paint_3d(self, gpu, eye, target, aspect, up=(0.0, 0.0, 1.0)):
         glEnable(GL_DEPTH_TEST)
         glDepthFunc(GL_LEQUAL)
         glDepthMask(True)
         glDisable(GL_BLEND)
         proj = Mat4.perspective_projection(aspect, 0.02, 40.0, fov=34.0)
-        view = _look(eye, target)
+        view = _look(eye, target, up)
         mvp = proj @ view
         camera = (float(eye[0]), float(eye[1]), float(eye[2]))
         # The line is drawn first and writes depth. The glass is drawn
@@ -699,8 +709,10 @@ class Demo:
 
     def draw_follow(self):
         fb_w, fb_h = self._begin(self.follow, self.gpu_follow)
-        eye, target = self._follow_eye()
-        self._paint_3d(self.gpu_follow, eye, target, max(fb_w, 1) / max(fb_h, 1))
+        eye, target, up = self._follow_eye()
+        self._paint_3d(
+            self.gpu_follow, eye, target, max(fb_w, 1) / max(fb_h, 1), up=up,
+        )
         glDisable(GL_DEPTH_TEST)
         glViewport(0, 0, fb_w, fb_h)
         w, h = self.follow.get_size()
