@@ -49,6 +49,8 @@ pyglet.options["shadow_window"] = False
 SECTOR_COPIES = 3
 SLANT_LENGTH = 1.0
 LINE_OFFSET = 0.62
+# Opacity of each cone wall. 1 is solid, 0 is invisible.
+CONE_ALPHA = 0.6
 SAMPLES = 480
 WALK_PER_SECOND = 36.0
 
@@ -630,9 +632,9 @@ class Demo:
         glDepthMask(False)
         glEnable(GL_CULL_FACE)
         glCullFace(GL_FRONT)
-        gpu.draw("cone", mvp, camera, lit=1.0, alpha=0.28)
+        gpu.draw("cone", mvp, camera, lit=1.0, alpha=CONE_ALPHA)
         glCullFace(GL_BACK)
-        gpu.draw("cone", mvp, camera, lit=1.0, alpha=0.28)
+        gpu.draw("cone", mvp, camera, lit=1.0, alpha=CONE_ALPHA)
         glDepthMask(True)
         glDisable(GL_BLEND)
         glDisable(GL_CULL_FACE)
