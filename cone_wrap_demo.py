@@ -755,24 +755,26 @@ def _smoothstep(u):
 
 
 def _morph_points(slant, phi, lap, t, alpha, beta, height):
-    """Blend the rolled cone into the unrolled sector that owns each point.
+    """Unroll one wound sheet. `lap` counts extra turns, so the angle never jumps.
 
-    Angle stays ordered with phi, so the sheet does not turn inside out.
-    A point's flat angle is the paper's polar angle, which makes the chord
-    a straight line once t reaches 1.
+    The cut at angle 0 stays put. The rest of the sheet swings open around it
+    until the paper is flat and the chord is a straight line.
     """
     slant = np.asarray(slant, dtype=np.float64)
     phi = np.asarray(phi, dtype=np.float64)
     lap = np.asarray(lap, dtype=np.float64)
-    flat_angle = phi * np.sin(alpha) + lap * beta
-    angle = (1.0 - t) * phi + t * flat_angle
+    turn = phi + lap * (2.0 * np.pi)
+    flat_angle = turn * (beta / (2.0 * np.pi))
+    angle = (1.0 - t) * turn + t * flat_angle
     radius = ((1.0 - t) * np.sin(alpha) + t) * slant
     z = (1.0 - t) * (height - slant * np.cos(alpha))
     return np.stack((radius * np.cos(angle), radius * np.sin(angle), z), axis=-1)
 
 
-def _morph_normals(phi, t, alpha):
-    cone = _surface_normal(np.asarray(phi, dtype=np.float64), alpha)
+def _morph_normals(phi, lap, t, alpha, beta):
+    turn = np.asarray(phi, dtype=np.float64) + np.asarray(lap, dtype=np.float64) * (2.0 * np.pi)
+    angle = turn * ((1.0 - t) + t * (beta / (2.0 * np.pi)))
+    cone = _surface_normal(angle, alpha)
     normals = (1.0 - t) * cone
     normals = np.array(normals, copy=True)
     normals[..., 2] += t
@@ -780,40 +782,27 @@ def _morph_normals(phi, t, alpha):
     return normals
 
 
-def _sector_corners(n_slant, n_phi):
-    """Cone-mesh corners, one full turn, in the same winding as `_cone_mesh`."""
+def _wound_sheet(n_slant, n_around, turns):
+    """One mesh wound `turns` times. The first and last edges are the single cut."""
     slant_rows = np.linspace(0.0, SLANT_LENGTH, n_slant)
-    phi_cols = np.linspace(0.0, 2.0 * np.pi, n_phi, endpoint=False)
+    n_phi = n_around * turns
+    psi_cols = np.linspace(0.0, turns * 2.0 * np.pi, n_phi, endpoint=False)
     ds = SLANT_LENGTH / (n_slant - 1)
-    dp = 2.0 * np.pi / n_phi
-    s, p = np.meshgrid(slant_rows[:-1], phi_cols, indexing="ij")
+    dp = (turns * 2.0 * np.pi) / n_phi
+    s, p = np.meshgrid(slant_rows[:-1], psi_cols, indexing="ij")
     s = s.ravel()
     p = p.ravel()
+    # Same winding as `_cone_mesh`: outward side is the front face.
     s_vert = np.stack((s, s + ds, s, s, s + ds, s + ds), axis=1).ravel()
     p_vert = np.stack((p, p + dp, p + dp, p, p, p + dp), axis=1).ravel()
     return s_vert, p_vert
 
 
-def _sheet_colors(lap, t):
+def _sheet_colors(count, t):
     cone = np.array(CONE_COLOR, dtype=np.float64)
-    sector = np.asarray(SECTOR_COLORS, dtype=np.float64)[np.asarray(lap, dtype=int)]
-    return (1.0 - t) * cone + t * sector
-
-
-def _split_ribbon(points, normals, colors, laps, half_width):
-    """Ribbon the path in pieces so a sector seam does not stretch a chord across the gap."""
-    positions, out_normals, out_colors = [], [], []
-    start = 0
-    count = len(points)
-    for i in range(1, count + 1):
-        if i == count or int(laps[i]) != int(laps[start]):
-            if i - start >= 2:
-                piece = _ribbon(points[start:i], normals[start:i], colors[start:i], half_width)
-                positions.extend(piece[0])
-                out_normals.extend(piece[1])
-                out_colors.extend(piece[2])
-            start = i
-    return positions, out_normals, out_colors
+    paper = np.array(SECTOR_COLORS[1], dtype=np.float64)
+    color = (1.0 - t) * cone + t * paper
+    return np.tile(color, (count, 1))
 
 
 def _assign_mesh(mesh, positions, normals, colors):
@@ -851,11 +840,8 @@ class _UnwrapFilm:
         self.path_color = np.array(
             [LAP_COLORS[int(k) % len(LAP_COLORS)] for k in lap], dtype=np.float64
         )
-        s_one, p_one = _sector_corners(36, 64)
-        copies = SECTOR_COPIES
-        self.sheet_s = np.tile(s_one, copies)
-        self.sheet_phi = np.tile(p_one, copies)
-        self.sheet_lap = np.repeat(np.arange(copies), len(s_one))
+        self.sheet_s, self.sheet_phi = _wound_sheet(36, 64, SECTOR_COPIES)
+        self.sheet_lap = np.zeros_like(self.sheet_phi)
         self.seam_s = np.linspace(0.0, SLANT_LENGTH, 24)
         self.window = None
         self.program = None
@@ -909,18 +895,19 @@ class _UnwrapFilm:
             np.cos(pitch) * np.sin(yaw),
             np.sin(pitch),
         ])
-        # The opening sheet swings through a full turn, so the middle view
-        # sits higher and farther back than either end pose.
-        eye_mid = np.array([0.0, -1.85, 3.40])
-        target_mid = np.array([0.0, 0.20, 0.05])
+        # The single sheet swings through more than a full turn, so this
+        # view stays high enough to see the whole disk until it is flat.
+        eye_mid = np.array([0.0, -0.20, 4.60])
+        target_mid = np.array([0.0, 0.0, 0.0])
         eye1 = np.array([0.0, -1.15, 2.45])
         target1 = np.array([0.0, 0.40, 0.0])
-        if blend <= 0.55:
-            b = _smoothstep(blend / 0.55) if blend > 0.0 else 0.0
+        split = 0.92
+        if blend <= split:
+            b = _smoothstep(blend / split) if blend > 0.0 else 0.0
             eye = (1.0 - b) * eye0 + b * eye_mid
             target = (1.0 - b) * target0 + b * target_mid
         else:
-            b = _smoothstep((blend - 0.55) / 0.45)
+            b = _smoothstep((blend - split) / (1.0 - split))
             eye = (1.0 - b) * eye_mid + b * eye1
             target = (1.0 - b) * target_mid + b * target1
         return eye, target
@@ -929,10 +916,10 @@ class _UnwrapFilm:
         points = _morph_points(
             self.path_s, self.path_phi, self.path_lap, t, self.alpha, self.beta, self.height,
         )
-        normals = _morph_normals(self.path_phi, t, self.alpha) * 0.006
-        positions, out_normals, out_colors = _split_ribbon(
-            points, normals, self.path_color, self.path_lap, 0.009,
-        )
+        normals = _morph_normals(
+            self.path_phi, self.path_lap, t, self.alpha, self.beta,
+        ) * 0.006
+        positions, out_normals, out_colors = _ribbon(points, normals, self.path_color, 0.009)
         return (
             np.asarray(positions, dtype=np.float32).reshape(-1, 3),
             np.asarray(out_normals, dtype=np.float32).reshape(-1, 3),
@@ -941,19 +928,18 @@ class _UnwrapFilm:
 
     def _seam_arrays(self, t):
         positions, normals, colors = [], [], []
-        for lap in range(SECTOR_COPIES):
-            for edge in (0.0, 2.0 * np.pi):
-                phi = np.full_like(self.seam_s, edge)
-                laps = np.full(self.seam_s.shape, lap)
-                points = _morph_points(
-                    self.seam_s, phi, laps, t, self.alpha, self.beta, self.height,
-                )
-                lifted = _morph_normals(phi, t, self.alpha) * 0.002
-                ink = np.tile(np.array(INK, dtype=np.float64), (len(self.seam_s), 1))
-                piece = _ribbon(points, lifted, ink, 0.004)
-                positions.extend(piece[0])
-                normals.extend(piece[1])
-                colors.extend(piece[2])
+        for edge in (0.0, SECTOR_COPIES * 2.0 * np.pi):
+            phi = np.full_like(self.seam_s, edge)
+            laps = np.zeros_like(self.seam_s)
+            points = _morph_points(
+                self.seam_s, phi, laps, t, self.alpha, self.beta, self.height,
+            )
+            lifted = _morph_normals(phi, laps, t, self.alpha, self.beta) * 0.002
+            ink = np.tile(np.array(INK, dtype=np.float64), (len(self.seam_s), 1))
+            piece = _ribbon(points, lifted, ink, 0.004)
+            positions.extend(piece[0])
+            normals.extend(piece[1])
+            colors.extend(piece[2])
         return (
             np.asarray(positions, dtype=np.float32).reshape(-1, 3),
             np.asarray(normals, dtype=np.float32).reshape(-1, 3),
@@ -964,8 +950,8 @@ class _UnwrapFilm:
         positions = _morph_points(
             self.sheet_s, self.sheet_phi, self.sheet_lap, t, self.alpha, self.beta, self.height,
         )
-        normals = _morph_normals(self.sheet_phi, t, self.alpha)
-        colors = _sheet_colors(self.sheet_lap, t)
+        normals = _morph_normals(self.sheet_phi, self.sheet_lap, t, self.alpha, self.beta)
+        colors = _sheet_colors(len(self.sheet_s), t)
         _assign_mesh(self.sheet, positions, normals, colors)
         _assign_mesh(self.path, *self._path_arrays(t))
         _assign_mesh(self.seam, *self._seam_arrays(t))
@@ -1004,7 +990,10 @@ class _UnwrapFilm:
             self.path_s[index], self.path_phi[index], self.path_lap[index],
             t, self.alpha, self.beta, self.height,
         )
-        normal = _morph_normals(np.array([self.path_phi[index]]), t, self.alpha)[0]
+        normal = _morph_normals(
+            np.array([self.path_phi[index]]), np.array([self.path_lap[index]]),
+            t, self.alpha, self.beta,
+        )[0]
         dot = point + normal * 0.025
         color = LAP_COLORS[int(self.path_lap[index]) % len(LAP_COLORS)]
         self.dot.color[:] = np.tile(color, len(self.dot.color) // 3)
