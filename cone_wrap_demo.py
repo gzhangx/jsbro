@@ -1,8 +1,8 @@
 """
 A straight line on an unrolled cone wraps around the cone.
 
-The 3D views are OpenGL. The cone is a solid mesh with a depth buffer,
-so the surface covers the part of the line that winds behind it.
+The 3D views are OpenGL. The cone is glass: the depth buffer keeps the
+near line solid, and the wall tints the part of the line behind it.
 
 Two windows open. The first shows the unrolled sectors beside the cone.
 The second follows the dot. Drag either 3D view to turn it.
@@ -14,18 +14,25 @@ Run:
 import numpy as np
 import pyglet
 from pyglet.gl import (
+    GL_BLEND,
     GL_COLOR_BUFFER_BIT,
+    GL_BACK,
     GL_CULL_FACE,
     GL_DEPTH_BUFFER_BIT,
     GL_DEPTH_TEST,
+    GL_FRONT,
     GL_LEQUAL,
+    GL_ONE_MINUS_SRC_ALPHA,
     GL_SCISSOR_TEST,
+    GL_SRC_ALPHA,
     GL_TRIANGLES,
     Config,
+    glBlendFunc,
     glClear,
     glClearColor,
     glCullFace,
     glDepthFunc,
+    glDepthMask,
     glDisable,
     glEnable,
     glScissor,
@@ -128,10 +135,11 @@ def _cone_mesh(alpha, n_slant=48, n_phi=96):
             c01, n01 = corner(s, p2)
             c11, n11 = corner(s2, p2)
             c10, n10 = corner(s2, p)
-            # p00, p01, p11, p00, p11, p10 — CCW when seen from outside.
+            # Reversed so the outward side is the front face. The other
+            # order made the wall toward the camera the one that was culled.
             for vertex, normal in (
-                (c00, n00), (c01, n01), (c11, n11),
-                (c00, n00), (c11, n11), (c10, n10),
+                (c00, n00), (c11, n11), (c01, n01),
+                (c00, n00), (c10, n10), (c11, n11),
             ):
                 positions.extend(vertex.tolist())
                 normals.extend(normal.tolist())
@@ -272,6 +280,7 @@ in vec3 v_world;
 uniform vec3 u_light;
 uniform vec3 u_camera;
 uniform float u_lit;
+uniform float u_alpha;
 
 out vec4 frag_color;
 
@@ -279,14 +288,15 @@ void main() {
     vec3 color = v_color;
     if (u_lit > 0.5) {
         vec3 n = normalize(v_normal);
+        if (!gl_FrontFacing) n = -n;
         vec3 light = normalize(u_light);
         float diffuse = max(dot(n, light), 0.0);
         vec3 view = normalize(u_camera - v_world);
         vec3 half_dir = normalize(light + view);
         float spec = pow(max(dot(n, half_dir), 0.0), 28.0);
-        color = color * (0.38 + 0.72 * diffuse) + vec3(spec * 0.18);
+        color = color * (0.5 + 0.62 * diffuse) + vec3(spec * 0.14);
     }
-    frag_color = vec4(color, 1.0);
+    frag_color = vec4(color, u_alpha);
 }
 """
 
@@ -324,17 +334,19 @@ class Renderer:
             "seam": _upload(self.program, *g["seam"]),
             "fan": _upload(self.program, *g["fan"]),
             "paper": _upload(self.program, *g["paper"]),
-            "dot": _upload(self.program, *_sphere(0.018, 10, 14)),
+            "dot": _upload(self.program, *_sphere(0.012, 10, 14)),
             "paper_dot": _upload(self.program, *_disk(0.045, 20, 0.02)),
         }
         self.program["u_light"] = (0.35, -0.55, 0.76)
         self.program["u_model"] = Mat4()
+        self.program["u_alpha"] = 1.0
 
-    def draw(self, name, mvp, camera, lit, model=None):
+    def draw(self, name, mvp, camera, lit, model=None, alpha=1.0):
         self.program["u_mvp"] = mvp
         self.program["u_model"] = Mat4() if model is None else model
         self.program["u_camera"] = camera
         self.program["u_lit"] = float(lit)
+        self.program["u_alpha"] = float(alpha)
         self.program.use()
         self.meshes[name].draw(GL_TRIANGLES)
 
@@ -448,11 +460,11 @@ class Demo:
                 font_size=12, color=ink, anchor_x="center", anchor_y="top",
             ),
             "cone": pyglet.text.Label(
-                "Rolled back up  ·  the cone covers the far side",
+                "Rolled back up  ·  the cone is glass",
                 font_size=12, color=ink, anchor_x="center", anchor_y="top",
             ),
             "hint": pyglet.text.Label(
-                "Drag the cone to turn it.  The surface hides the line behind it.",
+                "Drag the cone to turn it.  The glass lets the far side of the line show through.",
                 font_size=11, color=muted, anchor_x="center", anchor_y="bottom",
             ),
             "status": pyglet.text.Label(
@@ -573,38 +585,35 @@ class Demo:
     def _follow_eye(self):
         i = self.frame
         pos = self.cone[i]
-        phi = self.phi[i]
-        normal = _surface_normal(np.array([phi]), self.alpha)[0]
-        eye = pos + normal * 0.48 + np.array([0.0, 0.0, 0.06])
-        target = pos * 0.35 + np.array([0.0, 0.0, pos[2]])
+        phi = float(self.phi[i])
+        target = np.array([0.0, 0.0, float(pos[2])])
+        outward = np.array([np.cos(phi), np.sin(phi), 0.0])
         if self.follow_orbit is not None:
             yaw, pitch = self.follow_orbit
-            offset = eye - target
-            turned = np.array([
-                offset[0] * np.cos(yaw) - offset[1] * np.sin(yaw),
-                offset[0] * np.sin(yaw) + offset[1] * np.cos(yaw),
-                offset[2],
+            c, s = np.cos(yaw), np.sin(yaw)
+            outward = np.array([
+                outward[0] * c - outward[1] * s,
+                outward[0] * s + outward[1] * c,
+                0.0,
             ])
-            flat = np.array([turned[0], turned[1], 0.0])
-            flat_n = np.linalg.norm(flat) + 1e-12
-            eye = target + turned + flat / flat_n * 0.0
-            eye = target + np.array([
-                turned[0],
-                turned[1],
-                turned[2] + pitch * 0.25,
-            ])
+            lift = 0.22 + pitch * 0.35
+        else:
+            lift = 0.22
+        eye = target + outward * 0.95 + np.array([0.0, 0.0, lift])
         return eye, target
 
     def _paint_3d(self, gpu, eye, target, aspect):
         glEnable(GL_DEPTH_TEST)
         glDepthFunc(GL_LEQUAL)
-        glEnable(GL_CULL_FACE)
-        glCullFace(0x0405)  # GL_BACK
+        glDepthMask(True)
+        glDisable(GL_BLEND)
         proj = Mat4.perspective_projection(aspect, 0.02, 40.0, fov=34.0)
         view = _look(eye, target)
         mvp = proj @ view
         camera = (float(eye[0]), float(eye[1]), float(eye[2]))
-        gpu.draw("cone", mvp, camera, lit=1.0)
+        # The line is drawn first and writes depth. The glass is drawn
+        # afterward without writing depth, so it tints the far line and
+        # leaves the nearer line solid.
         glDisable(GL_CULL_FACE)
         gpu.draw("seam", mvp, camera, lit=0.0)
         gpu.draw("path", mvp, camera, lit=0.0)
@@ -615,6 +624,18 @@ class Demo:
         color = LAP_COLORS[int(self.lap[i]) % len(LAP_COLORS)]
         gpu.meshes["dot"].color[:] = np.tile(color, len(gpu.meshes["dot"].color) // 3)
         gpu.draw("dot", mvp, camera, lit=1.0, model=_translate(*dot))
+
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glDepthMask(False)
+        glEnable(GL_CULL_FACE)
+        glCullFace(GL_FRONT)
+        gpu.draw("cone", mvp, camera, lit=1.0, alpha=0.28)
+        glCullFace(GL_BACK)
+        gpu.draw("cone", mvp, camera, lit=1.0, alpha=0.28)
+        glDepthMask(True)
+        glDisable(GL_BLEND)
+        glDisable(GL_CULL_FACE)
 
     def _begin(self, window, gpu):
         window.switch_to()
@@ -631,8 +652,8 @@ class Demo:
         split = int(fb_w * 0.50)
         glEnable(GL_SCISSOR_TEST)
 
-        glViewport(0, 0, split, fb_h)
-        glScissor(0, 0, split, fb_h)
+        glViewport(0, 0, max(split, 1), fb_h)
+        glScissor(0, 0, max(split, 1), fb_h)
         glDisable(GL_DEPTH_TEST)
         glDisable(GL_CULL_FACE)
         ortho = Mat4.orthogonal_projection(-1.35, 1.35, -0.42, 1.28, -1.0, 1.0)
@@ -656,6 +677,8 @@ class Demo:
         self._paint_3d(self.gpu_main, eye, target, aspect)
 
         glDisable(GL_SCISSOR_TEST)
+        glDisable(GL_DEPTH_TEST)
+        glViewport(0, 0, fb_w, fb_h)
         w, h = self.main.get_size()
         labels = self.main_labels
         labels["title"].x = w * 0.5
@@ -676,6 +699,8 @@ class Demo:
         fb_w, fb_h = self._begin(self.follow, self.gpu_follow)
         eye, target = self._follow_eye()
         self._paint_3d(self.gpu_follow, eye, target, max(fb_w, 1) / max(fb_h, 1))
+        glDisable(GL_DEPTH_TEST)
+        glViewport(0, 0, fb_w, fb_h)
         w, h = self.follow.get_size()
         i = self.frame
         labels = self.follow_labels
