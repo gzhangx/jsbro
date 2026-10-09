@@ -7,9 +7,16 @@ near line solid, and the wall tints the part of the line behind it.
 Two windows open. The first shows the unrolled sectors beside the cone.
 The second follows the dot. Drag either 3D view to turn it.
 
-Run:
     python cone_wrap_demo.py
+    python cone_wrap_demo.py -save
+    python cone_wrap_demo.py -save movie.mp4
+
+-save writes a movie, then exits: the dot walks the cone, walks back while
+the cone unrolls, then walks the flat net in a straight line.
 """
+
+import argparse
+import os
 
 import numpy as np
 import pyglet
@@ -22,10 +29,15 @@ from pyglet.gl import (
     GL_DEPTH_TEST,
     GL_FRONT,
     GL_LEQUAL,
+    GL_LESS,
     GL_ONE_MINUS_SRC_ALPHA,
+    GL_PACK_ALIGNMENT,
+    GL_RGB,
     GL_SCISSOR_TEST,
     GL_SRC_ALPHA,
     GL_TRIANGLES,
+    GL_UNSIGNED_BYTE,
+    GLubyte,
     Config,
     glBlendFunc,
     glClear,
@@ -35,6 +47,9 @@ from pyglet.gl import (
     glDepthMask,
     glDisable,
     glEnable,
+    glFinish,
+    glPixelStorei,
+    glReadPixels,
     glScissor,
     glViewport,
 )
@@ -610,8 +625,8 @@ class Demo:
             yaw, pitch = self.follow_orbit
             forward = _rotate(forward, normal, yaw)
             normal = _rotate(normal, forward, -pitch)
-        eye = pos - forward * 0.28 + normal * 0.05
-        target = pos + forward * 0.45
+        eye = pos - forward * 0.92 + normal * 0.18
+        target = pos + forward * 0.55
         return eye, target, normal
 
     def _paint_3d(self, gpu, eye, target, aspect, up=(0.0, 0.0, 1.0)):
@@ -734,8 +749,376 @@ class Demo:
         pyglet.app.run()
 
 
+def _smoothstep(u):
+    u = float(np.clip(u, 0.0, 1.0))
+    return u * u * (3.0 - 2.0 * u)
+
+
+def _morph_points(slant, phi, lap, t, alpha, beta, height):
+    """Blend the rolled cone into the unrolled sector that owns each point.
+
+    Angle stays ordered with phi, so the sheet does not turn inside out.
+    A point's flat angle is the paper's polar angle, which makes the chord
+    a straight line once t reaches 1.
+    """
+    slant = np.asarray(slant, dtype=np.float64)
+    phi = np.asarray(phi, dtype=np.float64)
+    lap = np.asarray(lap, dtype=np.float64)
+    flat_angle = phi * np.sin(alpha) + lap * beta
+    angle = (1.0 - t) * phi + t * flat_angle
+    radius = ((1.0 - t) * np.sin(alpha) + t) * slant
+    z = (1.0 - t) * (height - slant * np.cos(alpha))
+    return np.stack((radius * np.cos(angle), radius * np.sin(angle), z), axis=-1)
+
+
+def _morph_normals(phi, t, alpha):
+    cone = _surface_normal(np.asarray(phi, dtype=np.float64), alpha)
+    normals = (1.0 - t) * cone
+    normals = np.array(normals, copy=True)
+    normals[..., 2] += t
+    normals /= np.maximum(np.linalg.norm(normals, axis=-1, keepdims=True), 1e-8)
+    return normals
+
+
+def _sector_corners(n_slant, n_phi):
+    """Cone-mesh corners, one full turn, in the same winding as `_cone_mesh`."""
+    slant_rows = np.linspace(0.0, SLANT_LENGTH, n_slant)
+    phi_cols = np.linspace(0.0, 2.0 * np.pi, n_phi, endpoint=False)
+    ds = SLANT_LENGTH / (n_slant - 1)
+    dp = 2.0 * np.pi / n_phi
+    s, p = np.meshgrid(slant_rows[:-1], phi_cols, indexing="ij")
+    s = s.ravel()
+    p = p.ravel()
+    s_vert = np.stack((s, s + ds, s, s, s + ds, s + ds), axis=1).ravel()
+    p_vert = np.stack((p, p + dp, p + dp, p, p, p + dp), axis=1).ravel()
+    return s_vert, p_vert
+
+
+def _sheet_colors(lap, t):
+    cone = np.array(CONE_COLOR, dtype=np.float64)
+    sector = np.asarray(SECTOR_COLORS, dtype=np.float64)[np.asarray(lap, dtype=int)]
+    return (1.0 - t) * cone + t * sector
+
+
+def _split_ribbon(points, normals, colors, laps, half_width):
+    """Ribbon the path in pieces so a sector seam does not stretch a chord across the gap."""
+    positions, out_normals, out_colors = [], [], []
+    start = 0
+    count = len(points)
+    for i in range(1, count + 1):
+        if i == count or int(laps[i]) != int(laps[start]):
+            if i - start >= 2:
+                piece = _ribbon(points[start:i], normals[start:i], colors[start:i], half_width)
+                positions.extend(piece[0])
+                out_normals.extend(piece[1])
+                out_colors.extend(piece[2])
+            start = i
+    return positions, out_normals, out_colors
+
+
+def _assign_mesh(mesh, positions, normals, colors):
+    mesh.position[:] = np.ascontiguousarray(positions, dtype=np.float32).ravel()
+    mesh.normal[:] = np.ascontiguousarray(normals, dtype=np.float32).ravel()
+    mesh.color[:] = np.ascontiguousarray(colors, dtype=np.float32).ravel()
+
+
+def _empty_mesh(program, count):
+    zeros = [0.0] * (count * 3)
+    return program.vertex_list(
+        count,
+        GL_TRIANGLES,
+        position=("f", zeros),
+        normal=("f", zeros),
+        color=("f", zeros),
+    )
+
+
+class _UnwrapFilm:
+    """One 3D view that rolls the cone out into the straight-line net."""
+
+    def __init__(self):
+        alpha, beta = cone_angles(SECTOR_COPIES)
+        paper_x, paper_y = straight_line_on_paper(SLANT_LENGTH, LINE_OFFSET, SAMPLES)
+        _cx, _cy, _cz, slant, _unrolled, phi, lap = map_to_cone(
+            paper_x, paper_y, alpha, beta
+        )
+        self.alpha = alpha
+        self.beta = beta
+        self.height = SLANT_LENGTH * np.cos(alpha)
+        self.path_s = slant
+        self.path_phi = phi
+        self.path_lap = lap
+        self.path_color = np.array(
+            [LAP_COLORS[int(k) % len(LAP_COLORS)] for k in lap], dtype=np.float64
+        )
+        s_one, p_one = _sector_corners(36, 64)
+        copies = SECTOR_COPIES
+        self.sheet_s = np.tile(s_one, copies)
+        self.sheet_phi = np.tile(p_one, copies)
+        self.sheet_lap = np.repeat(np.arange(copies), len(s_one))
+        self.seam_s = np.linspace(0.0, SLANT_LENGTH, 24)
+        self.window = None
+        self.program = None
+        self.sheet = None
+        self.path = None
+        self.seam = None
+        self.dot = None
+        self.caption = None
+
+    def open(self, width=1280, height=720):
+        config = Config(depth_size=24, double_buffer=True, major_version=3, minor_version=3)
+        self.window = pyglet.window.Window(
+            width, height, caption="Saving cone unwrap", resizable=False, vsync=False, config=config,
+        )
+        self.window.switch_to()
+
+        @self.window.event
+        def on_draw():
+            pass
+
+        self.program = ShaderProgram(Shader(VERTEX_SRC, "vertex"), Shader(FRAGMENT_SRC, "fragment"))
+        self.program["u_light"] = (0.35, -0.55, 0.76)
+        self.program["u_model"] = Mat4()
+        self.program["u_alpha"] = 1.0
+        self.sheet = _empty_mesh(self.program, len(self.sheet_s))
+        path_verts = self._path_arrays(0.0)[0].shape[0]
+        self.path = _empty_mesh(self.program, path_verts)
+        seam_verts = self._seam_arrays(0.0)[0].shape[0]
+        self.seam = _empty_mesh(self.program, seam_verts)
+        dot_positions, dot_normals, dot_colors = _sphere(0.02, 12, 16)
+        self.dot = _upload(self.program, dot_positions, dot_normals, dot_colors)
+        ink = tuple(int(c * 255) for c in INK) + (255,)
+        self.caption = pyglet.text.Label(
+            "", font_size=16, color=ink, anchor_x="center", anchor_y="top",
+        )
+        glPixelStorei(GL_PACK_ALIGNMENT, 1)
+
+    def close(self):
+        if self.window is not None:
+            self.window.close()
+            self.window = None
+
+    def _pose(self, blend):
+        """Cone overview, then a high view while the sheet sweeps open, then the flat net."""
+        yaw = np.deg2rad(-62.0)
+        pitch = np.deg2rad(24.0)
+        distance = 2.45
+        target0 = np.array([0.0, 0.0, self.height * 0.42])
+        eye0 = target0 + distance * np.array([
+            np.cos(pitch) * np.cos(yaw),
+            np.cos(pitch) * np.sin(yaw),
+            np.sin(pitch),
+        ])
+        # The opening sheet swings through a full turn, so the middle view
+        # sits higher and farther back than either end pose.
+        eye_mid = np.array([0.0, -1.85, 3.40])
+        target_mid = np.array([0.0, 0.20, 0.05])
+        eye1 = np.array([0.0, -1.15, 2.45])
+        target1 = np.array([0.0, 0.40, 0.0])
+        if blend <= 0.55:
+            b = _smoothstep(blend / 0.55) if blend > 0.0 else 0.0
+            eye = (1.0 - b) * eye0 + b * eye_mid
+            target = (1.0 - b) * target0 + b * target_mid
+        else:
+            b = _smoothstep((blend - 0.55) / 0.45)
+            eye = (1.0 - b) * eye_mid + b * eye1
+            target = (1.0 - b) * target_mid + b * target1
+        return eye, target
+
+    def _path_arrays(self, t):
+        points = _morph_points(
+            self.path_s, self.path_phi, self.path_lap, t, self.alpha, self.beta, self.height,
+        )
+        normals = _morph_normals(self.path_phi, t, self.alpha) * 0.006
+        positions, out_normals, out_colors = _split_ribbon(
+            points, normals, self.path_color, self.path_lap, 0.009,
+        )
+        return (
+            np.asarray(positions, dtype=np.float32).reshape(-1, 3),
+            np.asarray(out_normals, dtype=np.float32).reshape(-1, 3),
+            np.asarray(out_colors, dtype=np.float32).reshape(-1, 3),
+        )
+
+    def _seam_arrays(self, t):
+        positions, normals, colors = [], [], []
+        for lap in range(SECTOR_COPIES):
+            for edge in (0.0, 2.0 * np.pi):
+                phi = np.full_like(self.seam_s, edge)
+                laps = np.full(self.seam_s.shape, lap)
+                points = _morph_points(
+                    self.seam_s, phi, laps, t, self.alpha, self.beta, self.height,
+                )
+                lifted = _morph_normals(phi, t, self.alpha) * 0.002
+                ink = np.tile(np.array(INK, dtype=np.float64), (len(self.seam_s), 1))
+                piece = _ribbon(points, lifted, ink, 0.004)
+                positions.extend(piece[0])
+                normals.extend(piece[1])
+                colors.extend(piece[2])
+        return (
+            np.asarray(positions, dtype=np.float32).reshape(-1, 3),
+            np.asarray(normals, dtype=np.float32).reshape(-1, 3),
+            np.asarray(colors, dtype=np.float32).reshape(-1, 3),
+        )
+
+    def _upload_frame(self, t):
+        positions = _morph_points(
+            self.sheet_s, self.sheet_phi, self.sheet_lap, t, self.alpha, self.beta, self.height,
+        )
+        normals = _morph_normals(self.sheet_phi, t, self.alpha)
+        colors = _sheet_colors(self.sheet_lap, t)
+        _assign_mesh(self.sheet, positions, normals, colors)
+        _assign_mesh(self.path, *self._path_arrays(t))
+        _assign_mesh(self.seam, *self._seam_arrays(t))
+
+    def _draw_mesh(self, mesh, mvp, camera, lit, model=None, alpha=1.0):
+        self.program["u_mvp"] = mvp
+        self.program["u_model"] = Mat4() if model is None else model
+        self.program["u_camera"] = (float(camera[0]), float(camera[1]), float(camera[2]))
+        self.program["u_lit"] = float(lit)
+        self.program["u_alpha"] = float(alpha)
+        self.program.use()
+        mesh.draw(GL_TRIANGLES)
+
+    def draw(self, t, index, blend, caption):
+        self.window.switch_to()
+        self._upload_frame(t)
+        fb_w, fb_h = self.window.get_framebuffer_size()
+        glViewport(0, 0, fb_w, fb_h)
+        glDisable(GL_SCISSOR_TEST)
+        glClearColor(*PAPER)
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        eye, target = self._pose(blend)
+        aspect = max(fb_w, 1) / max(fb_h, 1)
+        proj = Mat4.perspective_projection(aspect, 0.02, 40.0, fov=32.0)
+        view = _look(eye, target, (0.0, 0.0, 1.0))
+        mvp = proj @ view
+
+        glEnable(GL_DEPTH_TEST)
+        glDepthFunc(GL_LEQUAL)
+        glDepthMask(True)
+        glDisable(GL_BLEND)
+        glDisable(GL_CULL_FACE)
+        self._draw_mesh(self.seam, mvp, eye, lit=0.0)
+        self._draw_mesh(self.path, mvp, eye, lit=0.0)
+        point = _morph_points(
+            self.path_s[index], self.path_phi[index], self.path_lap[index],
+            t, self.alpha, self.beta, self.height,
+        )
+        normal = _morph_normals(np.array([self.path_phi[index]]), t, self.alpha)[0]
+        dot = point + normal * 0.025
+        color = LAP_COLORS[int(self.path_lap[index]) % len(LAP_COLORS)]
+        self.dot.color[:] = np.tile(color, len(self.dot.color) // 3)
+        self._draw_mesh(self.dot, mvp, eye, lit=1.0, model=_translate(*dot))
+
+        # Coincident copies share a depth. GL_LESS keeps the later copies
+        # from stacking glass on top of the first one.
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glDepthMask(False)
+        glEnable(GL_CULL_FACE)
+        glDepthFunc(GL_LESS)
+        glCullFace(GL_FRONT)
+        self._draw_mesh(self.sheet, mvp, eye, lit=1.0, alpha=CONE_ALPHA)
+        glCullFace(GL_BACK)
+        self._draw_mesh(self.sheet, mvp, eye, lit=1.0, alpha=CONE_ALPHA)
+        glDepthMask(True)
+        glDisable(GL_BLEND)
+        glDisable(GL_CULL_FACE)
+        glDepthFunc(GL_LEQUAL)
+
+        glDisable(GL_DEPTH_TEST)
+        glViewport(0, 0, fb_w, fb_h)
+        w, h = self.window.get_size()
+        self.caption.text = caption
+        self.caption.x = w * 0.5
+        self.caption.y = h - 16
+        self.caption.draw()
+
+    def read_rgb(self):
+        self.window.switch_to()
+        glFinish()
+        fb_w, fb_h = self.window.get_framebuffer_size()
+        w = fb_w - (fb_w % 2)
+        h = fb_h - (fb_h % 2)
+        buf = (GLubyte * (w * h * 3))()
+        glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, buf)
+        frame = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3)
+        return np.flipud(frame).copy()
+
+    def present(self):
+        self.window.flip()
+        self.window.dispatch_events()
+
+
+def _movie_frames(phase_seconds, fps):
+    """Full cycle on the cone, reverse while unrolling, full cycle on the flat net."""
+    captions = (
+        "Walking around the cone",
+        "Walking back while the cone unrolls",
+        "Unrolled: the same path is a straight line",
+    )
+    counts = [max(2, int(round(seconds * fps))) for seconds in phase_seconds]
+    for phase, count in enumerate(counts):
+        for frame in range(count):
+            u = frame / (count - 1)
+            if phase == 0:
+                t, blend, reverse = 0.0, 0.0, False
+            elif phase == 1:
+                eased = _smoothstep(u)
+                t, blend, reverse = eased, eased, True
+            else:
+                t, blend, reverse = 1.0, 1.0, False
+            walk = 1.0 - u if reverse else u
+            index = int(round(walk * (SAMPLES - 1)))
+            yield t, index, blend, captions[phase]
+
+
+def save_animation(path, phase_seconds=(8.0, 6.0, 8.0), fps=30):
+    """Record the unwrap movie and return the file path."""
+    import imageio.v2 as imageio
+
+    path = os.path.abspath(path)
+    folder = os.path.dirname(path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    frames = list(_movie_frames(phase_seconds, fps))
+    print(f"Saving {len(frames)} frames to {path}")
+    film = _UnwrapFilm()
+    film.open()
+    try:
+        writer = imageio.get_writer(
+            path, fps=fps, codec="libx264", quality=8, macro_block_size=1,
+        )
+        try:
+            for number, (t, index, blend, caption) in enumerate(frames, start=1):
+                film.draw(t, index, blend, caption)
+                writer.append_data(film.read_rgb())
+                film.present()
+                if number == 1 or number % 30 == 0 or number == len(frames):
+                    print(f"  {number}/{len(frames)}  {caption}", flush=True)
+        finally:
+            writer.close()
+    finally:
+        film.close()
+    print(f"Saved {path}")
+    return path
+
+
 def main():
-    Demo().run()
+    parser = argparse.ArgumentParser(description="Straight line wrapped around a cone.")
+    parser.add_argument(
+        "-save",
+        nargs="?",
+        const="cone_unwrap.mp4",
+        default=None,
+        metavar="FILE",
+        help="Save the unwrap animation to FILE (default: cone_unwrap.mp4) and exit.",
+    )
+    args = parser.parse_args()
+    if args.save is not None:
+        save_animation(args.save)
+    else:
+        Demo().run()
 
 
 if __name__ == "__main__":
