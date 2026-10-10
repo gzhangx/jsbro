@@ -11,8 +11,8 @@ The second follows the dot. Drag either 3D view to turn it.
     python cone_wrap_demo.py -save
     python cone_wrap_demo.py -save movie.mp4
 
--save writes a movie, then exits: the dot walks the cone, walks back while
-the cone unrolls, then walks the flat net in a straight line.
+-save writes a movie, then exits: the dot walks the cone, the cone unrolls
+slowly while the dot keeps the same pace, then the dot walks the flat net.
 """
 
 import argparse
@@ -1043,30 +1043,47 @@ class _UnwrapFilm:
         self.window.dispatch_events()
 
 
+def _path_index(laps):
+    """Walk back and forth along the path. Whole laps sit on an endpoint."""
+    if laps <= 0.0:
+        return 0
+    whole = int(np.floor(laps))
+    frac = laps - whole
+    if frac < 1e-9:
+        return SAMPLES - 1 if whole % 2 == 1 else 0
+    along = frac if whole % 2 == 0 else 1.0 - frac
+    return int(round(along * (SAMPLES - 1)))
+
+
 def _movie_frames(phase_seconds, fps):
-    """Full cycle on the cone, reverse while unrolling, full cycle on the flat net."""
+    """One cycle on the cone, a slow unroll with the dot at the same speed, then the flat net.
+
+    The unwrap lasts several cycles of the path. The sheet eases open across
+    that whole time, and the dot keeps the pace it had on the cone, so it
+    travels the path more than once while the turns come apart.
+    """
     captions = (
         "Walking around the cone",
-        "Walking back while the cone unrolls",
+        "Unrolling",
         "Unrolled: the same path is a straight line",
     )
     counts = [max(2, int(round(seconds * fps))) for seconds in phase_seconds]
+    # How many path cycles fit in the unwrap if the dot does not slow down.
+    unwrap_laps = phase_seconds[1] / phase_seconds[0]
     for phase, count in enumerate(counts):
         for frame in range(count):
             u = frame / (count - 1)
             if phase == 0:
-                t, blend, reverse = 0.0, 0.0, False
+                t, blend, laps = 0.0, 0.0, u
             elif phase == 1:
                 eased = _smoothstep(u)
-                t, blend, reverse = eased, eased, True
+                t, blend, laps = eased, eased, 1.0 + u * unwrap_laps
             else:
-                t, blend, reverse = 1.0, 1.0, False
-            walk = 1.0 - u if reverse else u
-            index = int(round(walk * (SAMPLES - 1)))
-            yield t, index, blend, captions[phase]
+                t, blend, laps = 1.0, 1.0, u
+            yield t, _path_index(laps), blend, captions[phase]
 
 
-def save_animation(path, phase_seconds=(8.0, 6.0, 8.0), fps=30):
+def save_animation(path, phase_seconds=(8.0, 24.0, 8.0), fps=30):
     """Record the unwrap movie and return the file path."""
     import imageio.v2 as imageio
 
