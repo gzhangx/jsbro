@@ -890,6 +890,18 @@ def _assign_mesh(mesh, positions, normals, colors):
     mesh.color[:] = np.ascontiguousarray(colors, dtype=np.float32).ravel()
 
 
+def _far_to_near(positions, normals, colors, eye):
+    """Draw farther triangles first so inner layers blend with their own normals."""
+    count = len(positions) // 3
+    center = positions.reshape(count, 3, 3).mean(axis=1)
+    order = np.argsort(np.sum((center - eye) ** 2, axis=1))[::-1]
+    return (
+        positions.reshape(count, 3, 3)[order].reshape(-1, 3),
+        normals.reshape(count, 3, 3)[order].reshape(-1, 3),
+        colors.reshape(count, 3, 3)[order].reshape(-1, 3),
+    )
+
+
 def _empty_mesh(program, count):
     zeros = [0.0] * (count * 3)
     return program.vertex_list(
@@ -1025,12 +1037,19 @@ class _UnwrapFilm:
         )
         return _mark_discs(centers + normals * 0.006, normals, MARK_RADIUS, INK)
 
-    def _upload_frame(self, t, gap):
+    def _upload_frame(self, t, gap, eye):
         positions = _morph_points(
             self.sheet_s, self.sheet_phi, self.sheet_lap, t, self.alpha, self.beta, self.height, gap,
         )
         normals = _morph_normals(self.sheet_phi, self.sheet_lap, t, self.alpha, self.beta)
-        _assign_mesh(self.sheet, positions, normals, self.sheet_color)
+        # While the turns sit on top of each other, depth writes keep the extra
+        # copies out. Once they separate, the near wall would hide the inner
+        # turns and only their back faces would show, lit with a flipped normal.
+        if gap > 1e-4 or t > 1e-4:
+            positions, normals, colors = _far_to_near(positions, normals, self.sheet_color, eye)
+        else:
+            colors = self.sheet_color
+        _assign_mesh(self.sheet, positions, normals, colors)
         _assign_mesh(self.path, *self._path_arrays(t, gap))
         _assign_mesh(self.seam, *self._seam_arrays(t, gap))
         _assign_mesh(self.marks, *self._mark_arrays(t, gap))
@@ -1046,13 +1065,13 @@ class _UnwrapFilm:
 
     def draw(self, t, index, blend, caption, gap=0.0):
         self.window.switch_to()
-        self._upload_frame(t, gap)
+        eye, target = self._pose(blend)
+        self._upload_frame(t, gap, eye)
         fb_w, fb_h = self.window.get_framebuffer_size()
         glViewport(0, 0, fb_w, fb_h)
         glDisable(GL_SCISSOR_TEST)
         glClearColor(*PAPER)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-        eye, target = self._pose(blend)
         aspect = max(fb_w, 1) / max(fb_h, 1)
         proj = Mat4.perspective_projection(aspect, 0.02, 40.0, fov=32.0)
         view = _look(eye, target, (0.0, 0.0, 1.0))
@@ -1079,11 +1098,11 @@ class _UnwrapFilm:
         self.dot.color[:] = np.tile(color, len(self.dot.color) // 3)
         self._draw_mesh(self.dot, mvp, eye, lit=1.0, model=_translate(*dot))
 
-        # The sheet is one color the whole time. Depth writes keep the stacked
-        # windings from blending into a darker color as the unwrap begins.
+        # One color the whole time. Depth writes only while the windings coincide,
+        # so a separated inner layer is drawn on its outside instead of its back.
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-        glDepthMask(True)
+        glDepthMask(not (gap > 1e-4 or t > 1e-4))
         glEnable(GL_CULL_FACE)
         glDepthFunc(GL_LESS)
         glCullFace(GL_FRONT)
