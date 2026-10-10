@@ -77,8 +77,9 @@ LAP_COLORS = (
     (0.141, 0.345, 0.651),
 )
 CONE_COLOR = (0.894, 0.765, 0.588)
-# Dotted rings measure distance from the apex. Dotted spokes measure the way around.
+# Three dotted lines, parallel on the unrolled paper.
 MARK_RADIUS = 0.013
+MARK_OFFSETS = (0.34, 0.48, 0.82)
 
 
 def cone_angles(copies):
@@ -161,25 +162,19 @@ def _cone_mesh(alpha, n_slant=48, n_phi=96):
     return positions, normals, colors
 
 
-def _mark_samples(turns):
-    """Dots that trace rings and spokes on the paper, once per winding."""
-    ring_slants = np.linspace(0.30, 0.88, 4)
-    around = 18
-    spokes = 8
-    along = 6
+def _mark_samples():
+    """Dots along three lines that are parallel on the unrolled paper."""
+    beta = np.pi / SECTOR_COPIES
     slants = []
     angles = []
-    for lap in range(turns):
-        base = lap * 2.0 * np.pi
-        for slant in ring_slants:
-            phi = (np.arange(around) + 0.5) / around * 2.0 * np.pi
-            slants.append(np.full(around, slant))
-            angles.append(base + phi)
-        for spoke in range(spokes):
-            phi = (spoke + 0.5) / spokes * 2.0 * np.pi
-            samples = np.linspace(0.18, 0.94, along)
-            slants.append(samples)
-            angles.append(np.full(along, base + phi))
+    for offset in MARK_OFFSETS:
+        half = np.sqrt(SLANT_LENGTH**2 - offset**2)
+        abscissa = np.linspace(half, -half, 11)
+        ordinate = np.full_like(abscissa, offset)
+        slant = np.hypot(abscissa, ordinate)
+        unrolled = np.arctan2(ordinate, abscissa)
+        slants.append(slant)
+        angles.append(unrolled * (2.0 * np.pi / beta))
     return np.concatenate(slants), np.concatenate(angles)
 
 
@@ -286,7 +281,7 @@ def _fan_mesh(beta, length, copies):
 
 def _fan_marks(beta, length, copies):
     """Same dotted rings and spokes, laid on the unrolled net."""
-    slant, turn = _mark_samples(copies)
+    slant, turn = _mark_samples()
     lap = np.floor(turn / (2.0 * np.pi))
     local = turn - lap * (2.0 * np.pi)
     unrolled = (local / (2.0 * np.pi)) * beta + lap * beta
@@ -303,7 +298,7 @@ def _fan_marks(beta, length, copies):
 
 
 def _cone_marks(alpha, beta, height):
-    slant, turn = _mark_samples(1)
+    slant, turn = _mark_samples()
     centers = _morph_points(slant, turn, np.zeros_like(slant), 0.0, alpha, beta, height)
     normals = _morph_normals(turn, np.zeros_like(slant), 0.0, alpha, beta)
     centers = centers + normals * 0.006
@@ -920,7 +915,7 @@ class _UnwrapFilm:
         self.sheet_s, self.sheet_phi = _wound_sheet(36, 64, SECTOR_COPIES)
         self.sheet_lap = np.zeros_like(self.sheet_phi)
         self.sheet_color = np.tile(np.array(CONE_COLOR, dtype=np.float32), (len(self.sheet_s), 1))
-        self.mark_s, self.mark_turn = _mark_samples(SECTOR_COPIES)
+        self.mark_s, self.mark_turn = _mark_samples()
         self.seam_s = np.linspace(0.0, SLANT_LENGTH, 24)
         self.window = None
         self.program = None
