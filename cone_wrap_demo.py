@@ -71,17 +71,14 @@ WALK_PER_SECOND = 36.0
 
 PAPER = (0.965, 0.945, 0.906, 1.0)
 INK = (0.141, 0.110, 0.078)
-SECTOR_COLORS = (
-    (0.965, 0.843, 0.659),
-    (0.953, 0.894, 0.737),
-    (0.906, 0.827, 0.631),
-)
 LAP_COLORS = (
     (0.769, 0.271, 0.180),
     (0.122, 0.478, 0.271),
     (0.141, 0.345, 0.651),
 )
 CONE_COLOR = (0.894, 0.765, 0.588)
+# Dotted rings measure distance from the apex. Dotted spokes measure the way around.
+MARK_RADIUS = 0.013
 
 
 def cone_angles(copies):
@@ -144,8 +141,8 @@ def _cone_mesh(alpha, n_slant=48, n_phi=96):
 
     ds = SLANT_LENGTH / (n_slant - 1)
     dp = 2.0 * np.pi / n_phi
-    for i, s in enumerate(slant[:-1]):
-        for j, p in enumerate(phi):
+    for s in slant[:-1]:
+        for p in phi:
             p2 = p + dp
             s2 = s + ds
             c00, n00 = corner(s, p)
@@ -162,6 +159,58 @@ def _cone_mesh(alpha, n_slant=48, n_phi=96):
                 normals.extend(normal.tolist())
                 colors.extend(cone.tolist())
     return positions, normals, colors
+
+
+def _mark_samples(turns):
+    """Dots that trace rings and spokes on the paper, once per winding."""
+    ring_slants = np.linspace(0.30, 0.88, 4)
+    around = 18
+    spokes = 8
+    along = 6
+    slants = []
+    angles = []
+    for lap in range(turns):
+        base = lap * 2.0 * np.pi
+        for slant in ring_slants:
+            phi = (np.arange(around) + 0.5) / around * 2.0 * np.pi
+            slants.append(np.full(around, slant))
+            angles.append(base + phi)
+        for spoke in range(spokes):
+            phi = (spoke + 0.5) / spokes * 2.0 * np.pi
+            samples = np.linspace(0.18, 0.94, along)
+            slants.append(samples)
+            angles.append(np.full(along, base + phi))
+    return np.concatenate(slants), np.concatenate(angles)
+
+
+def _mark_discs(centers, normals, radius, color, segments=6):
+    """Crisp discs lying on the surface. No color is shared across a triangle."""
+    centers = np.asarray(centers, dtype=np.float64)
+    normals = np.asarray(normals, dtype=np.float64)
+    count = len(centers)
+    normal = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-12)
+    helper = np.tile(np.array([0.0, 0.0, 1.0]), (count, 1))
+    helper[np.abs(normal[:, 2]) > 0.9] = (1.0, 0.0, 0.0)
+    axis_u = np.cross(normal, helper)
+    axis_u /= np.linalg.norm(axis_u, axis=1, keepdims=True) + 1e-12
+    axis_v = np.cross(normal, axis_u)
+    angles = np.linspace(0.0, 2.0 * np.pi, segments, endpoint=False)
+    step = 2.0 * np.pi / segments
+    center = centers[:, None, :]
+    axis_u = axis_u[:, None, :]
+    axis_v = axis_v[:, None, :]
+    angle = angles[None, :, None]
+    rim0 = center + radius * (np.cos(angle) * axis_u + np.sin(angle) * axis_v)
+    rim1 = center + radius * (np.cos(angle + step) * axis_u + np.sin(angle + step) * axis_v)
+    triangles = np.stack((np.broadcast_to(center, rim0.shape), rim0, rim1), axis=2)
+    positions = np.ascontiguousarray(triangles.reshape(-1, 3), dtype=np.float32)
+    out_normals = np.ascontiguousarray(
+        np.repeat(normal, segments * 3, axis=0), dtype=np.float32,
+    )
+    out_colors = np.ascontiguousarray(
+        np.tile(np.asarray(color, dtype=np.float32), (len(positions), 1)), dtype=np.float32,
+    )
+    return positions, out_normals, out_colors
 
 
 def _ribbon(points, normals, colors, half_width):
@@ -216,9 +265,9 @@ def _disk(radius, segments, z=0.0):
 
 def _fan_mesh(beta, length, copies):
     positions, normals, colors = [], [], []
-    steps = 24
+    steps = 36
+    color = CONE_COLOR
     for lap in range(copies):
-        color = SECTOR_COLORS[lap]
         a0 = np.pi - (lap + 1) * beta
         a1 = np.pi - lap * beta
         angles = np.linspace(a0, a1, steps)
@@ -233,6 +282,33 @@ def _fan_mesh(beta, length, copies):
                 normals.extend((0.0, 0.0, 1.0))
                 colors.extend(color)
     return positions, normals, colors
+
+
+def _fan_marks(beta, length, copies):
+    """Same dotted rings and spokes, laid on the unrolled net."""
+    slant, turn = _mark_samples(copies)
+    lap = np.floor(turn / (2.0 * np.pi))
+    local = turn - lap * (2.0 * np.pi)
+    unrolled = (local / (2.0 * np.pi)) * beta + lap * beta
+    screen = np.pi - unrolled
+    centers = np.stack((
+        slant * np.cos(screen),
+        slant * np.sin(screen),
+        np.full_like(slant, 0.02),
+    ), axis=1)
+    normals = np.zeros_like(centers)
+    normals[:, 2] = 1.0
+    positions, out_normals, colors = _mark_discs(centers, normals, 0.02, INK)
+    return positions.reshape(-1).tolist(), out_normals.reshape(-1).tolist(), colors.reshape(-1).tolist()
+
+
+def _cone_marks(alpha, beta, height):
+    slant, turn = _mark_samples(1)
+    centers = _morph_points(slant, turn, np.zeros_like(slant), 0.0, alpha, beta, height)
+    normals = _morph_normals(turn, np.zeros_like(slant), 0.0, alpha, beta)
+    centers = centers + normals * 0.006
+    positions, out_normals, colors = _mark_discs(centers, normals, MARK_RADIUS, INK)
+    return positions.reshape(-1).tolist(), out_normals.reshape(-1).tolist(), colors.reshape(-1).tolist()
 
 
 def _paper_ribbon(x, y, lap, half_width):
@@ -350,6 +426,8 @@ class Renderer:
             "path": _upload(self.program, *g["path"]),
             "seam": _upload(self.program, *g["seam"]),
             "fan": _upload(self.program, *g["fan"]),
+            "fan_marks": _upload(self.program, *g["fan_marks"]),
+            "marks": _upload(self.program, *g["marks"]),
             "paper": _upload(self.program, *g["paper"]),
             "dot": _upload(self.program, *_sphere(0.012, 10, 14)),
             "paper_dot": _upload(self.program, *_disk(0.045, 20, 0.02)),
@@ -445,6 +523,8 @@ class Demo:
             "path": path,
             "seam": seam,
             "fan": _fan_mesh(beta, SLANT_LENGTH, SECTOR_COPIES),
+            "fan_marks": _fan_marks(beta, SLANT_LENGTH, SECTOR_COPIES),
+            "marks": _cone_marks(alpha, beta, height),
             "paper": _paper_ribbon(paper_x, paper_y, lap, 0.018),
         }
         self.alpha = alpha
@@ -643,6 +723,7 @@ class Demo:
         # leaves the nearer line solid.
         glDisable(GL_CULL_FACE)
         gpu.draw("seam", mvp, camera, lit=0.0)
+        gpu.draw("marks", mvp, camera, lit=0.0)
         gpu.draw("path", mvp, camera, lit=0.0)
         i = self.frame
         pos = self.cone[i]
@@ -686,6 +767,7 @@ class Demo:
         ortho = Mat4.orthogonal_projection(-1.35, 1.35, -0.42, 1.28, -1.0, 1.0)
         camera = (0.0, 0.0, 1.0)
         self.gpu_main.draw("fan", ortho, camera, lit=0.0)
+        self.gpu_main.draw("fan_marks", ortho, camera, lit=0.0)
         self.gpu_main.draw("paper", ortho, camera, lit=0.0)
         i = self.frame
         color = LAP_COLORS[int(self.lap[i]) % len(LAP_COLORS)]
@@ -798,11 +880,6 @@ def _wound_sheet(n_slant, n_around, turns):
     return s_vert, p_vert
 
 
-def _sheet_colors(count, t):
-    cone = np.array(CONE_COLOR, dtype=np.float64)
-    paper = np.array(SECTOR_COLORS[1], dtype=np.float64)
-    color = (1.0 - t) * cone + t * paper
-    return np.tile(color, (count, 1))
 
 
 def _assign_mesh(mesh, positions, normals, colors):
@@ -842,12 +919,15 @@ class _UnwrapFilm:
         )
         self.sheet_s, self.sheet_phi = _wound_sheet(36, 64, SECTOR_COPIES)
         self.sheet_lap = np.zeros_like(self.sheet_phi)
+        self.sheet_color = np.tile(np.array(CONE_COLOR, dtype=np.float32), (len(self.sheet_s), 1))
+        self.mark_s, self.mark_turn = _mark_samples(SECTOR_COPIES)
         self.seam_s = np.linspace(0.0, SLANT_LENGTH, 24)
         self.window = None
         self.program = None
         self.sheet = None
         self.path = None
         self.seam = None
+        self.marks = None
         self.dot = None
         self.caption = None
 
@@ -867,6 +947,8 @@ class _UnwrapFilm:
         self.program["u_model"] = Mat4()
         self.program["u_alpha"] = 1.0
         self.sheet = _empty_mesh(self.program, len(self.sheet_s))
+        mark_positions, _, _ = self._mark_arrays(0.0)
+        self.marks = _empty_mesh(self.program, len(mark_positions))
         path_verts = self._path_arrays(0.0)[0].shape[0]
         self.path = _empty_mesh(self.program, path_verts)
         seam_verts = self._seam_arrays(0.0)[0].shape[0]
@@ -946,15 +1028,25 @@ class _UnwrapFilm:
             np.asarray(colors, dtype=np.float32).reshape(-1, 3),
         )
 
+    def _mark_arrays(self, t):
+        centers = _morph_points(
+            self.mark_s, self.mark_turn, np.zeros_like(self.mark_s),
+            t, self.alpha, self.beta, self.height,
+        )
+        normals = _morph_normals(
+            self.mark_turn, np.zeros_like(self.mark_s), t, self.alpha, self.beta,
+        )
+        return _mark_discs(centers + normals * 0.006, normals, MARK_RADIUS, INK)
+
     def _upload_frame(self, t):
         positions = _morph_points(
             self.sheet_s, self.sheet_phi, self.sheet_lap, t, self.alpha, self.beta, self.height,
         )
         normals = _morph_normals(self.sheet_phi, self.sheet_lap, t, self.alpha, self.beta)
-        colors = _sheet_colors(len(self.sheet_s), t)
-        _assign_mesh(self.sheet, positions, normals, colors)
+        _assign_mesh(self.sheet, positions, normals, self.sheet_color)
         _assign_mesh(self.path, *self._path_arrays(t))
         _assign_mesh(self.seam, *self._seam_arrays(t))
+        _assign_mesh(self.marks, *self._mark_arrays(t))
 
     def _draw_mesh(self, mesh, mvp, camera, lit, model=None, alpha=1.0):
         self.program["u_mvp"] = mvp
@@ -985,6 +1077,7 @@ class _UnwrapFilm:
         glDisable(GL_BLEND)
         glDisable(GL_CULL_FACE)
         self._draw_mesh(self.seam, mvp, eye, lit=0.0)
+        self._draw_mesh(self.marks, mvp, eye, lit=0.0)
         self._draw_mesh(self.path, mvp, eye, lit=0.0)
         point = _morph_points(
             self.path_s[index], self.path_phi[index], self.path_lap[index],
@@ -999,15 +1092,11 @@ class _UnwrapFilm:
         self.dot.color[:] = np.tile(color, len(self.dot.color) // 3)
         self._draw_mesh(self.dot, mvp, eye, lit=1.0, model=_translate(*dot))
 
-        # The sheet is wound several turns, so at the start those turns sit
-        # on top of each other. Depth writes plus GL_LESS keep the extra
-        # turns from stacking into a solid wall; one glass shell remains.
+        # The sheet is one color the whole time. Depth writes keep the stacked
+        # windings from blending into a darker color as the unwrap begins.
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-        # While the turns still coincide, writing depth stops them stacking
-        # into a solid cone. Once the sheet opens, leave the depth alone so
-        # the overlapping paper blends instead of flickering.
-        glDepthMask(t <= 1e-4)
+        glDepthMask(True)
         glEnable(GL_CULL_FACE)
         glDepthFunc(GL_LESS)
         glCullFace(GL_FRONT)
