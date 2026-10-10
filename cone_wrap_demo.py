@@ -11,8 +11,9 @@ The second follows the dot. Drag either 3D view to turn it.
     python cone_wrap_demo.py -save
     python cone_wrap_demo.py -save movie.mp4
 
--save writes a movie, then exits: the dot walks the cone, the cone unrolls
-slowly while the dot keeps the same pace, then the dot walks the flat net.
+-save writes a movie, then exits: the dot walks the cone, the wound layers
+ease apart, the cone unrolls slowly while the dot keeps the same pace, then
+the dot walks the flat net.
 """
 
 import argparse
@@ -79,6 +80,8 @@ LAP_COLORS = (
 CONE_COLOR = (0.894, 0.765, 0.588)
 # Three dotted lines, parallel on the unrolled paper.
 MARK_RADIUS = 0.013
+# How far each extra turn lifts off the cone, at the base, before the unroll.
+LAYER_SPACING = 0.04
 MARK_OFFSETS = (0.34, 0.48, 0.82)
 
 
@@ -831,11 +834,12 @@ def _smoothstep(u):
     return u * u * (3.0 - 2.0 * u)
 
 
-def _morph_points(slant, phi, lap, t, alpha, beta, height):
+def _morph_points(slant, phi, lap, t, alpha, beta, height, gap=0.0):
     """Unroll one wound sheet. `lap` counts extra turns, so the angle never jumps.
 
     The cut at angle 0 stays put. The rest of the sheet swings open around it
-    until the paper is flat and the chord is a straight line.
+    until the paper is flat and the chord is a straight line. `gap` lifts each
+    extra turn off the cone. It fades as the sheet opens, and the apex stays put.
     """
     slant = np.asarray(slant, dtype=np.float64)
     phi = np.asarray(phi, dtype=np.float64)
@@ -845,7 +849,10 @@ def _morph_points(slant, phi, lap, t, alpha, beta, height):
     angle = (1.0 - t) * turn + t * flat_angle
     radius = ((1.0 - t) * np.sin(alpha) + t) * slant
     z = (1.0 - t) * (height - slant * np.cos(alpha))
-    return np.stack((radius * np.cos(angle), radius * np.sin(angle), z), axis=-1)
+    points = np.stack((radius * np.cos(angle), radius * np.sin(angle), z), axis=-1)
+    lift = gap * (1.0 - t) * LAYER_SPACING * (turn / (2.0 * np.pi)) * slant
+    points = points + _surface_normal(angle, alpha) * lift[..., None]
+    return points
 
 
 def _morph_normals(phi, lap, t, alpha, beta):
@@ -942,11 +949,11 @@ class _UnwrapFilm:
         self.program["u_model"] = Mat4()
         self.program["u_alpha"] = 1.0
         self.sheet = _empty_mesh(self.program, len(self.sheet_s))
-        mark_positions, _, _ = self._mark_arrays(0.0)
+        mark_positions, _, _ = self._mark_arrays(0.0, 0.0)
         self.marks = _empty_mesh(self.program, len(mark_positions))
-        path_verts = self._path_arrays(0.0)[0].shape[0]
+        path_verts = self._path_arrays(0.0, 0.0)[0].shape[0]
         self.path = _empty_mesh(self.program, path_verts)
-        seam_verts = self._seam_arrays(0.0)[0].shape[0]
+        seam_verts = self._seam_arrays(0.0, 0.0)[0].shape[0]
         self.seam = _empty_mesh(self.program, seam_verts)
         dot_positions, dot_normals, dot_colors = _sphere(0.02, 12, 16)
         self.dot = _upload(self.program, dot_positions, dot_normals, dot_colors)
@@ -962,36 +969,21 @@ class _UnwrapFilm:
             self.window = None
 
     def _pose(self, blend):
-        """Cone overview, then a high view while the sheet sweeps open, then the flat net."""
+        """Hold the cone's view angle. Only the distance eases out so the sheet stays in frame."""
         yaw = np.deg2rad(-62.0)
         pitch = np.deg2rad(24.0)
-        distance = 2.45
-        target0 = np.array([0.0, 0.0, self.height * 0.42])
-        eye0 = target0 + distance * np.array([
+        direction = np.array([
             np.cos(pitch) * np.cos(yaw),
             np.cos(pitch) * np.sin(yaw),
             np.sin(pitch),
         ])
-        # The single sheet swings through more than a full turn, so this
-        # view stays high enough to see the whole disk until it is flat.
-        eye_mid = np.array([0.0, -0.20, 4.60])
-        target_mid = np.array([0.0, 0.0, 0.0])
-        eye1 = np.array([0.0, -1.15, 2.45])
-        target1 = np.array([0.0, 0.40, 0.0])
-        split = 0.92
-        if blend <= split:
-            b = _smoothstep(blend / split) if blend > 0.0 else 0.0
-            eye = (1.0 - b) * eye0 + b * eye_mid
-            target = (1.0 - b) * target0 + b * target_mid
-        else:
-            b = _smoothstep((blend - split) / (1.0 - split))
-            eye = (1.0 - b) * eye_mid + b * eye1
-            target = (1.0 - b) * target_mid + b * target1
-        return eye, target
+        target = np.array([0.0, 0.0, self.height * 0.42])
+        distance = 2.45 + 1.55 * blend
+        return target + distance * direction, target
 
-    def _path_arrays(self, t):
+    def _path_arrays(self, t, gap):
         points = _morph_points(
-            self.path_s, self.path_phi, self.path_lap, t, self.alpha, self.beta, self.height,
+            self.path_s, self.path_phi, self.path_lap, t, self.alpha, self.beta, self.height, gap,
         )
         normals = _morph_normals(
             self.path_phi, self.path_lap, t, self.alpha, self.beta,
@@ -1003,13 +995,13 @@ class _UnwrapFilm:
             np.asarray(out_colors, dtype=np.float32).reshape(-1, 3),
         )
 
-    def _seam_arrays(self, t):
+    def _seam_arrays(self, t, gap):
         positions, normals, colors = [], [], []
         for edge in (0.0, SECTOR_COPIES * 2.0 * np.pi):
             phi = np.full_like(self.seam_s, edge)
             laps = np.zeros_like(self.seam_s)
             points = _morph_points(
-                self.seam_s, phi, laps, t, self.alpha, self.beta, self.height,
+                self.seam_s, phi, laps, t, self.alpha, self.beta, self.height, gap,
             )
             lifted = _morph_normals(phi, laps, t, self.alpha, self.beta) * 0.002
             ink = np.tile(np.array(INK, dtype=np.float64), (len(self.seam_s), 1))
@@ -1023,25 +1015,25 @@ class _UnwrapFilm:
             np.asarray(colors, dtype=np.float32).reshape(-1, 3),
         )
 
-    def _mark_arrays(self, t):
+    def _mark_arrays(self, t, gap):
         centers = _morph_points(
             self.mark_s, self.mark_turn, np.zeros_like(self.mark_s),
-            t, self.alpha, self.beta, self.height,
+            t, self.alpha, self.beta, self.height, gap,
         )
         normals = _morph_normals(
             self.mark_turn, np.zeros_like(self.mark_s), t, self.alpha, self.beta,
         )
         return _mark_discs(centers + normals * 0.006, normals, MARK_RADIUS, INK)
 
-    def _upload_frame(self, t):
+    def _upload_frame(self, t, gap):
         positions = _morph_points(
-            self.sheet_s, self.sheet_phi, self.sheet_lap, t, self.alpha, self.beta, self.height,
+            self.sheet_s, self.sheet_phi, self.sheet_lap, t, self.alpha, self.beta, self.height, gap,
         )
         normals = _morph_normals(self.sheet_phi, self.sheet_lap, t, self.alpha, self.beta)
         _assign_mesh(self.sheet, positions, normals, self.sheet_color)
-        _assign_mesh(self.path, *self._path_arrays(t))
-        _assign_mesh(self.seam, *self._seam_arrays(t))
-        _assign_mesh(self.marks, *self._mark_arrays(t))
+        _assign_mesh(self.path, *self._path_arrays(t, gap))
+        _assign_mesh(self.seam, *self._seam_arrays(t, gap))
+        _assign_mesh(self.marks, *self._mark_arrays(t, gap))
 
     def _draw_mesh(self, mesh, mvp, camera, lit, model=None, alpha=1.0):
         self.program["u_mvp"] = mvp
@@ -1052,9 +1044,9 @@ class _UnwrapFilm:
         self.program.use()
         mesh.draw(GL_TRIANGLES)
 
-    def draw(self, t, index, blend, caption):
+    def draw(self, t, index, blend, caption, gap=0.0):
         self.window.switch_to()
-        self._upload_frame(t)
+        self._upload_frame(t, gap)
         fb_w, fb_h = self.window.get_framebuffer_size()
         glViewport(0, 0, fb_w, fb_h)
         glDisable(GL_SCISSOR_TEST)
@@ -1076,7 +1068,7 @@ class _UnwrapFilm:
         self._draw_mesh(self.path, mvp, eye, lit=0.0)
         point = _morph_points(
             self.path_s[index], self.path_phi[index], self.path_lap[index],
-            t, self.alpha, self.beta, self.height,
+            t, self.alpha, self.beta, self.height, gap,
         )
         normal = _morph_normals(
             np.array([self.path_phi[index]]), np.array([self.path_lap[index]]),
@@ -1140,34 +1132,40 @@ def _path_index(laps):
 
 
 def _movie_frames(phase_seconds, fps):
-    """One cycle on the cone, a slow unroll with the dot at the same speed, then the flat net.
+    """One cycle on the cone, a short layer separation, a slow unroll, then the flat net.
 
     The unwrap lasts several cycles of the path. The sheet eases open across
     that whole time, and the dot keeps the pace it had on the cone, so it
-    travels the path more than once while the turns come apart.
+    travels the path more than once while the turns come apart. Before that,
+    the stacked turns ease slightly apart. The dot holds at the end of the
+    first cycle during that move, then resumes. The camera keeps the cone's
+    view angle; it only eases back so the opening sheet fits.
     """
     captions = (
         "Walking around the cone",
+        "Separating the layers",
         "Unrolling",
         "Unrolled: the same path is a straight line",
     )
     counts = [max(2, int(round(seconds * fps))) for seconds in phase_seconds]
     # How many path cycles fit in the unwrap if the dot does not slow down.
-    unwrap_laps = phase_seconds[1] / phase_seconds[0]
+    unwrap_laps = phase_seconds[2] / phase_seconds[0]
     for phase, count in enumerate(counts):
         for frame in range(count):
             u = frame / (count - 1)
             if phase == 0:
-                t, blend, laps = 0.0, 0.0, u
+                t, gap, blend, laps = 0.0, 0.0, 0.0, u
             elif phase == 1:
+                t, gap, blend, laps = 0.0, _smoothstep(u), 0.0, 1.0
+            elif phase == 2:
                 eased = _smoothstep(u)
-                t, blend, laps = eased, eased, 1.0 + u * unwrap_laps
+                t, gap, blend, laps = eased, 1.0, eased, 1.0 + u * unwrap_laps
             else:
-                t, blend, laps = 1.0, 1.0, u
-            yield t, _path_index(laps), blend, captions[phase]
+                t, gap, blend, laps = 1.0, 1.0, 1.0, u
+            yield t, _path_index(laps), blend, captions[phase], gap
 
 
-def save_animation(path, phase_seconds=(8.0, 24.0, 8.0), fps=30):
+def save_animation(path, phase_seconds=(8.0, 5.0, 24.0, 8.0), fps=30):
     """Record the unwrap movie and return the file path."""
     import imageio.v2 as imageio
 
@@ -1184,8 +1182,8 @@ def save_animation(path, phase_seconds=(8.0, 24.0, 8.0), fps=30):
             path, fps=fps, codec="libx264", quality=8, macro_block_size=1,
         )
         try:
-            for number, (t, index, blend, caption) in enumerate(frames, start=1):
-                film.draw(t, index, blend, caption)
+            for number, (t, index, blend, caption, gap) in enumerate(frames, start=1):
+                film.draw(t, index, blend, caption, gap)
                 writer.append_data(film.read_rgb())
                 film.present()
                 if number == 1 or number % 30 == 0 or number == len(frames):
