@@ -999,11 +999,15 @@ class _UnwrapFilm:
         self.dot.color[:] = np.tile(color, len(self.dot.color) // 3)
         self._draw_mesh(self.dot, mvp, eye, lit=1.0, model=_translate(*dot))
 
-        # Coincident copies share a depth. GL_LESS keeps the later copies
-        # from stacking glass on top of the first one.
+        # The sheet is wound several turns, so at the start those turns sit
+        # on top of each other. Depth writes plus GL_LESS keep the extra
+        # turns from stacking into a solid wall; one glass shell remains.
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-        glDepthMask(False)
+        # While the turns still coincide, writing depth stops them stacking
+        # into a solid cone. Once the sheet opens, leave the depth alone so
+        # the overlapping paper blends instead of flickering.
+        glDepthMask(t <= 1e-4)
         glEnable(GL_CULL_FACE)
         glDepthFunc(GL_LESS)
         glCullFace(GL_FRONT)
