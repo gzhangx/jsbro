@@ -55,6 +55,11 @@ from mesh_flatten import (
 
 Vec3 = tuple[float, float, float]
 
+# Easy animation controls. Use a smaller BOUNCE_SPEED for slower springs:
+# 1.0 = normal speed, 0.5 = half speed, 0.25 = quarter speed.
+BOUNCE_SPEED = 0.4
+FLATTEN_DURATION_SECONDS = 4.0
+
 
 VERTEX_SHADER = """#version 330 core
 in vec3 position;
@@ -213,7 +218,7 @@ class STLViewer(pyglet.window.Window):
         self.flatten_future: Future[SpringEmbedding] | None = None
         self.status_message = ""
         self.flatten_elapsed = 0.0
-        self.flatten_duration = 4.0
+        self.flatten_duration = FLATTEN_DURATION_SECONDS
         self.flatten_note = ""
         self.projection_matrix = Mat4.perspective_projection(
             self.width / max(1, self.height),
@@ -338,7 +343,7 @@ class STLViewer(pyglet.window.Window):
                 self.mode = "relaxing"
                 self.status_message = f"Springs relaxing{self.flatten_note}..."
         elif self.mode == "relaxing" and self.solver is not None:
-            self.solver.step(dt)
+            self.solver.step(dt * BOUNCE_SPEED)
             self._sync_flat_positions()
             self.status_message = f"Spring error: {self.solver.energy:.6f}"
             if self.solver.settled:
