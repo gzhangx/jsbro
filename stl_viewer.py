@@ -25,39 +25,56 @@ from pyglet.gl import (
     GL_COLOR_BUFFER_BIT,
     GL_DEPTH_BUFFER_BIT,
     GL_DEPTH_TEST,
+    GL_FILL,
+    GL_FRONT_AND_BACK,
+    GL_LINE,
     GL_TRIANGLES,
     glClear,
     glClearColor,
+    glEnable,
+    glPolygonMode,
     glViewport,
 )
-try:
-    from pyglet.gl.gl_compat import (
-        GL_AMBIENT, GL_DIFFUSE, GL_FILL, GL_FRONT_AND_BACK, GL_LIGHT0,
-        GL_LIGHTING, GL_LINE, GL_MODELVIEW, GL_NORMALIZE, GL_POSITION,
-        GL_PROJECTION, GL_SMOOTH, GL_VERTEX_ARRAY, GL_NORMAL_ARRAY, GL_FLOAT,
-        GL_LIGHT_MODEL_TWO_SIDE, GL_LIGHT_MODEL_AMBIENT, GL_TRUE, GL_EMISSION,
-        GLfloat, glEnable, glEnableClientState, glDisableClientState,
-        glVertexPointer, glNormalPointer, glDrawArrays, glLightfv,
-        glLightModeli, glLightModelfv,
-        glLoadIdentity, glMaterialfv, glMatrixMode, glPolygonMode, glFrustum,
-        glRotatef, glShadeModel, glTranslatef,
-    )
-except ImportError:  # Pyglet 1.x
-    from pyglet.gl import (
-        GL_AMBIENT, GL_DIFFUSE, GL_FILL, GL_FRONT_AND_BACK, GL_LIGHT0,
-        GL_LIGHTING, GL_LINE, GL_MODELVIEW, GL_NORMALIZE, GL_POSITION,
-        GL_PROJECTION, GL_SMOOTH, GL_VERTEX_ARRAY, GL_NORMAL_ARRAY, GL_FLOAT,
-        GL_LIGHT_MODEL_TWO_SIDE, GL_LIGHT_MODEL_AMBIENT, GL_TRUE, GL_EMISSION,
-        GLfloat, glEnable, glEnableClientState, glDisableClientState,
-        glVertexPointer, glNormalPointer, glDrawArrays, glLightfv,
-        glLightModeli, glLightModelfv,
-        glLoadIdentity, glMaterialfv, glMatrixMode, glPolygonMode, glFrustum,
-        glRotatef, glShadeModel, glTranslatef,
-    )
+from pyglet.graphics.shader import Shader, ShaderProgram
+from pyglet.math import Mat4, Vec3 as PygletVec3
 from pyglet.window import key, mouse
 
 
 Vec3 = tuple[float, float, float]
+
+
+VERTEX_SHADER = """#version 330 core
+in vec3 position;
+in vec3 normal;
+
+uniform mat4 model;
+uniform mat4 view;
+uniform mat4 projection;
+
+out vec3 surface_normal;
+
+void main()
+{
+    gl_Position = projection * view * model * vec4(position, 1.0);
+    surface_normal = mat3(transpose(inverse(model))) * normal;
+}
+"""
+
+
+FRAGMENT_SHADER = """#version 330 core
+in vec3 surface_normal;
+out vec4 final_color;
+
+void main()
+{
+    vec3 n = normalize(surface_normal);
+    if (!gl_FrontFacing) n = -n;
+    vec3 light_direction = normalize(vec3(0.4, 0.6, 1.0));
+    float brightness = 0.30 + 0.70 * abs(dot(n, light_direction));
+    vec3 blue = vec3(0.28, 0.68, 1.0);
+    final_color = vec4(blue * brightness, 1.0);
+}
+"""
 
 
 def _normal(a: Vec3, b: Vec3, c: Vec3) -> Vec3:
@@ -132,38 +149,31 @@ class STLViewer(pyglet.window.Window):
             positions.extend((*a, *b, *c))
             normals.extend(normal * 3)
         self.vertex_count = len(points)
-        self.positions = (GLfloat * len(positions))(*positions)
-        self.normals = (GLfloat * len(normals))(*normals)
+        self.program = ShaderProgram(
+            Shader(VERTEX_SHADER, "vertex"),
+            Shader(FRAGMENT_SHADER, "fragment"),
+        )
+        self.vertex_list = self.program.vertex_list(
+            self.vertex_count,
+            GL_TRIANGLES,
+            position=("f", positions),
+            normal=("f", normals),
+        )
 
         self.rot_x = 20.0
         self.rot_y = -30.0
         self.pan_x = self.pan_y = 0.0
         self.distance = self.model_size * 2.8
         self.wireframe = False
+        self.projection_matrix = Mat4.perspective_projection(
+            self.width / max(1, self.height),
+            self.model_size / 1000,
+            self.model_size * 1000,
+            fov=45.0,
+        )
 
         glClearColor(0.08, 0.09, 0.12, 1.0)
         glEnable(GL_DEPTH_TEST)
-        glEnable(GL_LIGHTING)
-        glEnable(GL_LIGHT0)
-        glEnable(GL_NORMALIZE)
-        glShadeModel(GL_SMOOTH)
-        # STL normals are often reversed or inconsistent. Two-sided lighting
-        # plus a bright ambient component keeps either side clearly visible.
-        glLightModeli(GL_LIGHT_MODEL_TWO_SIDE, GL_TRUE)
-        glLightModelfv(
-            GL_LIGHT_MODEL_AMBIENT, (GLfloat * 4)(0.35, 0.35, 0.35, 1.0)
-        )
-        glLightfv(GL_LIGHT0, GL_AMBIENT, (GLfloat * 4)(0.40, 0.40, 0.40, 1.0))
-        glLightfv(GL_LIGHT0, GL_DIFFUSE, (GLfloat * 4)(1.0, 1.0, 1.0, 1.0))
-        glMaterialfv(
-            GL_FRONT_AND_BACK, GL_AMBIENT, (GLfloat * 4)(0.35, 0.65, 0.90, 1.0)
-        )
-        glMaterialfv(
-            GL_FRONT_AND_BACK, GL_DIFFUSE, (GLfloat * 4)(0.35, 0.70, 1.00, 1.0)
-        )
-        glMaterialfv(
-            GL_FRONT_AND_BACK, GL_EMISSION, (GLfloat * 4)(0.04, 0.08, 0.12, 1.0)
-        )
 
     def _reset(self) -> None:
         self.rot_x, self.rot_y = 20.0, -30.0
@@ -171,33 +181,35 @@ class STLViewer(pyglet.window.Window):
         self.distance = self.model_size * 2.8
 
     def on_resize(self, width: int, height: int):
+        result = super().on_resize(width, height)
         glViewport(0, 0, width, max(1, height))
-        glMatrixMode(GL_PROJECTION)
-        glLoadIdentity()
         near, far = self.model_size / 1000, self.model_size * 1000
-        top = near * math.tan(math.radians(45.0) / 2)
-        right = top * width / max(1, height)
-        glFrustum(-right, right, -top, top, near, far)
-        glMatrixMode(GL_MODELVIEW)
-        return super().on_resize(width, height)
+        self.projection_matrix = Mat4.perspective_projection(
+            width / max(1, height), near, far, fov=45.0
+        )
+        return result
 
     def on_draw(self) -> None:
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-        glLoadIdentity()
-        glTranslatef(self.pan_x, self.pan_y, -self.distance)
-        glLightfv(GL_LIGHT0, GL_POSITION, (GLfloat * 4)(1.0, 1.0, 2.0, 0.0))
-        glRotatef(self.rot_x, 1.0, 0.0, 0.0)
-        glRotatef(self.rot_y, 0.0, 1.0, 0.0)
-        glTranslatef(-self.center[0], -self.center[1], -self.center[2])
+        center = Mat4.from_translation(
+            PygletVec3(-self.center[0], -self.center[1], -self.center[2])
+        )
+        rotation = Mat4.from_rotation(
+            math.radians(self.rot_x), PygletVec3(1.0, 0.0, 0.0)
+        ) @ Mat4.from_rotation(
+            math.radians(self.rot_y), PygletVec3(0.0, 1.0, 0.0)
+        )
+        view = Mat4.from_translation(
+            PygletVec3(self.pan_x, self.pan_y, -self.distance)
+        )
+        self.program.use()
+        self.program["model"] = rotation @ center
+        self.program["view"] = view
+        self.program["projection"] = self.projection_matrix
         glPolygonMode(GL_FRONT_AND_BACK, GL_LINE if self.wireframe else GL_FILL)
-        glEnableClientState(GL_VERTEX_ARRAY)
-        glEnableClientState(GL_NORMAL_ARRAY)
-        glVertexPointer(3, GL_FLOAT, 0, self.positions)
-        glNormalPointer(GL_FLOAT, 0, self.normals)
-        glDrawArrays(GL_TRIANGLES, 0, self.vertex_count)
-        glDisableClientState(GL_NORMAL_ARRAY)
-        glDisableClientState(GL_VERTEX_ARRAY)
+        self.vertex_list.draw(GL_TRIANGLES)
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
+        self.program.stop()
 
     def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers) -> None:
         if buttons & mouse.LEFT:
