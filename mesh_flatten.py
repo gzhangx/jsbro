@@ -426,6 +426,9 @@ class SpringEmbedding:
         rotated = centered @ np.column_stack((x_axis, y_axis, z_axis))
         projected = rotated[:, :2]
         z_values = rotated[:, 2]
+        # Put the sweep base on Z=0; no untouched STL vertex starts below it.
+        rotated[:, 2] -= z_values.min()
+        z_values = rotated[:, 2]
         self.flatten_layer = (z_values - z_values.min()) / max(
             np.ptp(z_values), 1e-12
         )
@@ -433,7 +436,10 @@ class SpringEmbedding:
         normalized_projection = projected / max(radius, 1e-12)
         # Preserve the complete STL in the coordinate frame where the selected
         # cut direction is +Z. Layers remain here until the sweep reaches them.
-        model_radius = np.linalg.norm(rotated, axis=1).max(initial=1.0)
+        model_radius = max(
+            np.linalg.norm(projected, axis=1).max(initial=1.0),
+            float(np.ptp(z_values)),
+        )
         self.flatten_start_positions = (
             rotated / max(model_radius, 1e-12) * 0.72
         )
