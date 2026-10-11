@@ -82,7 +82,7 @@ class MeshFlattenTests(unittest.TestCase):
     def test_spring_embedding_converges(self):
         solver = SpringEmbedding(self.disk, np.random.default_rng(5))
         self.assertTrue(np.all(np.isfinite(solver.target)))
-        for _ in range(600):
+        for _ in range(1000):
             solver.step(1.0 / 60.0)
         self.assertTrue(solver.settled)
         np.testing.assert_allclose(solver.positions, solver.target, atol=1e-12)

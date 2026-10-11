@@ -384,7 +384,11 @@ class SpringEmbedding:
         _, axes = np.linalg.eigh(covariance)
         projected = centered @ axes[:, -2:]
         radius = np.linalg.norm(projected, axis=1).max(initial=1.0)
-        self.positions = projected / max(radius, 1e-12) * 0.45
+        normalized_projection = projected / max(radius, 1e-12)
+        # Duplicate seam vertices begin at the same projected 3D location.
+        # The viewer animates them spreading into the circular cut disk.
+        self.flatten_start_positions = normalized_projection * 0.72
+        self.positions = normalized_projection * 0.45
         self.positions += self.rng.normal(0.0, 0.015, self.positions.shape)
         self.positions[disk.boundary] = self.boundary_positions
         self.velocity = np.zeros_like(self.positions)
@@ -423,7 +427,7 @@ class SpringEmbedding:
         spring_force = self.average @ self.positions - self.positions
         target_force = self.target - self.positions
         acceleration = (
-            52.0 * spring_force + 16.0 * target_force - 4.5 * self.velocity
+            18.0 * spring_force + 6.0 * target_force - 2.0 * self.velocity
         )
         acceleration[self.boundary_mask] = 0.0
         self.velocity += acceleration * dt
@@ -434,7 +438,11 @@ class SpringEmbedding:
         difference = self.target - self.positions
         self.energy = float(np.sqrt(np.mean(difference[self.interior] ** 2)))
         speed = float(np.max(np.linalg.norm(self.velocity[self.interior], axis=1), initial=0.0))
-        if (self.elapsed > 1.5 and self.energy < 2e-4 and speed < 2e-3) or self.elapsed > 8.0:
+        if (
+            self.elapsed > 2.5
+            and self.energy < 2e-4
+            and speed < 2e-3
+        ) or self.elapsed > 14.0:
             self.positions[:] = self.target
             self.velocity.fill(0.0)
             self.energy = 0.0

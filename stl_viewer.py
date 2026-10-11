@@ -212,6 +212,9 @@ class STLViewer(pyglet.window.Window):
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mesh-cut")
         self.flatten_future: Future[SpringEmbedding] | None = None
         self.status_message = ""
+        self.flatten_elapsed = 0.0
+        self.flatten_duration = 4.0
+        self.flatten_note = ""
         self.projection_matrix = Mat4.perspective_projection(
             self.width / max(1, self.height),
             self.model_size / 1000,
@@ -262,7 +265,9 @@ class STLViewer(pyglet.window.Window):
         )
 
     def _create_flat_buffers(self, solver: SpringEmbedding) -> None:
-        positions = solver.positions.astype(np.float32, copy=False).reshape(-1)
+        positions = solver.flatten_start_positions.astype(
+            np.float32, copy=False
+        ).reshape(-1)
         indices = solver.disk.faces.astype(np.uint32, copy=False).reshape(-1)
         self.flat_vertex_list = self.flat_program.vertex_list_indexed(
             len(solver.positions),
@@ -277,12 +282,13 @@ class STLViewer(pyglet.window.Window):
             position=("f", positions),
         )
 
-    def _sync_flat_positions(self) -> None:
+    def _sync_flat_positions(self, positions: np.ndarray | None = None) -> None:
         if self.solver is None or self.flat_vertex_list is None:
             return
-        positions = self.solver.positions.astype(np.float32, copy=False).reshape(-1)
-        self.flat_vertex_list.position[:] = positions
-        self.boundary_vertex_list.position[:] = positions
+        source = self.solver.positions if positions is None else positions
+        flattened = source.astype(np.float32, copy=False).reshape(-1)
+        self.flat_vertex_list.position[:] = flattened
+        self.boundary_vertex_list.position[:] = flattened
 
     def _return_to_3d(self) -> None:
         self.mode = "3d"
@@ -290,6 +296,8 @@ class STLViewer(pyglet.window.Window):
         self.flat_vertex_list = None
         self.boundary_vertex_list = None
         self.status_message = ""
+        self.flatten_elapsed = 0.0
+        self.flatten_note = ""
         self.button.color = (42, 112, 178)
         self.button_label.text = "Random Cut & Flatten"
 
@@ -304,13 +312,31 @@ class STLViewer(pyglet.window.Window):
                     self.button.color = (42, 112, 178)
                     self.status_message = f"Could not flatten mesh: {exc}"
                 else:
-                    self.mode = "relaxing"
+                    self.mode = "flattening"
+                    self.flatten_elapsed = 0.0
                     self.button.color = (150, 70, 55)
                     self.button_label.text = "Back to 3D"
-                    fallback = " (fallback seams)" if self.solver.disk.used_fallback else ""
-                    self.status_message = f"Springs relaxing{fallback}..."
+                    self.flatten_note = (
+                        " (fallback seams)" if self.solver.disk.used_fallback else ""
+                    )
+                    self.status_message = f"Flattening cut{self.flatten_note}... 0%"
                 finally:
                     self.flatten_future = None
+        elif self.mode == "flattening" and self.solver is not None:
+            self.flatten_elapsed += min(dt, 1.0 / 20.0)
+            progress = min(1.0, self.flatten_elapsed / self.flatten_duration)
+            eased = progress * progress * (3.0 - 2.0 * progress)
+            positions = (
+                (1.0 - eased) * self.solver.flatten_start_positions
+                + eased * self.solver.positions
+            )
+            self._sync_flat_positions(positions)
+            self.status_message = (
+                f"Flattening cut{self.flatten_note}... {round(progress * 100):d}%"
+            )
+            if progress >= 1.0:
+                self.mode = "relaxing"
+                self.status_message = f"Springs relaxing{self.flatten_note}..."
         elif self.mode == "relaxing" and self.solver is not None:
             self.solver.step(dt)
             self._sync_flat_positions()
@@ -341,7 +367,7 @@ class STLViewer(pyglet.window.Window):
 
     def on_draw(self) -> None:
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-        if self.mode in {"relaxing", "flat"}:
+        if self.mode in {"flattening", "relaxing", "flat"}:
             self._draw_flat()
         else:
             self._draw_3d()
@@ -417,7 +443,7 @@ class STLViewer(pyglet.window.Window):
         ):
             if self.mode == "3d":
                 self._start_flattening()
-            elif self.mode in {"relaxing", "flat"}:
+            elif self.mode in {"flattening", "relaxing", "flat"}:
                 self._return_to_3d()
 
     def on_mouse_scroll(self, x, y, scroll_x, scroll_y) -> None:
