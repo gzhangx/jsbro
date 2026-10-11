@@ -101,7 +101,7 @@ void main()
 
 
 FLAT_VERTEX_SHADER = """#version 330 core
-in vec2 position;
+in vec3 position;
 uniform vec2 viewport_scale;
 uniform float rotation_x;
 uniform float rotation_y;
@@ -114,13 +114,13 @@ void main()
     float sx = sin(rotation_x);
     float cy = cos(rotation_y);
     float sy = sin(rotation_y);
-    vec3 point = vec3(position, 0.0);
+    vec3 point = position;
     point = vec3(point.x, cx * point.y - sx * point.z,
                  sx * point.y + cx * point.z);
     point = vec3(cy * point.x + sy * point.z, point.y,
                  -sy * point.x + cy * point.z);
     gl_Position = vec4(
-        point.xy * viewport_scale * zoom + view_offset, 0.0, 1.0
+        point.xy * viewport_scale * zoom + view_offset, -point.z * 0.6, 1.0
     );
 }
 """
@@ -350,6 +350,8 @@ class STLViewer(pyglet.window.Window):
         if self.solver is None or self.flat_vertex_list is None:
             return
         source = self.solver.positions if positions is None else positions
+        if source.shape[1] == 2:
+            source = np.column_stack((source, np.zeros(len(source))))
         flattened = source.astype(np.float32, copy=False).reshape(-1)
         self.flat_vertex_list.position[:] = flattened
         self.boundary_vertex_list.position[:] = flattened
@@ -443,9 +445,15 @@ class STLViewer(pyglet.window.Window):
             circle_scale = (
                 FLATTEN_START_SCALE + (1.0 - FLATTEN_START_SCALE) * expansion
             )
+            flat_target = np.column_stack(
+                (
+                    self.solver.positions * circle_scale,
+                    np.zeros(len(self.solver.positions)),
+                )
+            )
             positions = (
                 (1.0 - eased) * self.solver.flatten_start_positions
-                + eased * (self.solver.positions * circle_scale)
+                + eased * flat_target
             )
             self._sync_flat_positions(positions)
             self.status_message = (
@@ -529,7 +537,7 @@ class STLViewer(pyglet.window.Window):
     def _draw_flat(self) -> None:
         if self.flat_vertex_list is None or self.boundary_vertex_list is None:
             return
-        glDisable(GL_DEPTH_TEST)
+        glEnable(GL_DEPTH_TEST)
         shortest = max(1, min(self.width, self.height))
         scale = (
             0.84 * shortest / max(1, self.width),
@@ -544,6 +552,7 @@ class STLViewer(pyglet.window.Window):
         self.flat_program["color"] = (0.07, 0.25, 0.42, 1.0)
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
         self.flat_vertex_list.draw(GL_TRIANGLES)
+        glDisable(GL_DEPTH_TEST)
         self.flat_program["color"] = (0.30, 0.72, 1.0, 1.0)
         glLineWidth(1.0)
         glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)

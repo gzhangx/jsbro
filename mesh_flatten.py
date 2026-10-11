@@ -431,9 +431,12 @@ class SpringEmbedding:
         )
         radius = np.linalg.norm(projected, axis=1).max(initial=1.0)
         normalized_projection = projected / max(radius, 1e-12)
-        # Duplicate seam vertices begin at the same projected 3D location.
-        # The viewer animates them spreading into the circular cut disk.
-        self.flatten_start_positions = normalized_projection * 0.72
+        # Preserve the complete STL in the coordinate frame where the selected
+        # cut direction is +Z. Layers remain here until the sweep reaches them.
+        model_radius = np.linalg.norm(rotated, axis=1).max(initial=1.0)
+        self.flatten_start_positions = (
+            rotated / max(model_radius, 1e-12) * 0.72
+        )
         self.positions = normalized_projection * 0.45
         self.positions += self.rng.normal(0.0, 0.015, self.positions.shape)
         self.positions[disk.boundary] = self.boundary_positions
