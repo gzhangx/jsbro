@@ -447,12 +447,20 @@ class SpringEmbedding:
             rotated / max(model_radius, 1e-12) * 0.72
         )
         self.flatten_max_z = float(self.flatten_start_positions[:, 2].max())
-        self.positions = normalized_projection * 0.45
-        self.positions += self.rng.normal(0.0, 0.015, self.positions.shape)
-        self.positions[disk.boundary] = self.boundary_positions
-        self.initial_positions = self.positions.copy()
+        self.positions = np.zeros((len(disk.vertices), 2))
         self.velocity = np.zeros_like(self.positions)
         self.target = self._solve_equilibrium()
+        # Land beyond the collapsed projection so swept vertices travel outward
+        # to the unfolded disk. The later bounce settles back to equilibrium.
+        collapsed = normalized_projection * 0.45
+        collapsed[disk.boundary] = self.boundary_positions
+        stretch = self.target + 0.55 * (self.target - collapsed)
+        stretch_radius = np.linalg.norm(stretch, axis=1)
+        too_far = stretch_radius > 0.98
+        stretch[too_far] *= (0.98 / stretch_radius[too_far])[:, None]
+        stretch[disk.boundary] = self.boundary_positions
+        self.positions[:] = stretch
+        self.initial_positions = stretch.copy()
         self.bounce_frequency = self.rng.uniform(
             2.2, 3.2, (len(self.positions), 1)
         )

@@ -60,9 +60,10 @@ Vec3 = tuple[float, float, float]
 # 1.0 = normal speed, 0.5 = half speed, 0.25 = quarter speed.
 BOUNCE_SPEED = 0.4
 FLATTEN_DURATION_SECONDS = 4.0
-# Fraction of the Z sweep over which each layer is pulled outward.
-FLATTEN_LAYER_BLEND = 0.18
-FLATTEN_START_SCALE = 0.08
+# Fraction of the Z sweep over which each reached layer is pulled outward.
+FLATTEN_LAYER_BLEND = 0.10
+# The unfolded disk starts large enough for long stretch lines, then grows.
+FLATTEN_START_SCALE = 0.72
 KEY_ROTATION_SPEED = 65.0
 
 
