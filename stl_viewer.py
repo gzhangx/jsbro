@@ -105,6 +105,8 @@ in vec2 position;
 uniform vec2 viewport_scale;
 uniform float rotation_x;
 uniform float rotation_y;
+uniform float zoom;
+uniform vec2 view_offset;
 
 void main()
 {
@@ -117,7 +119,9 @@ void main()
                  sx * point.y + cx * point.z);
     point = vec3(cy * point.x + sy * point.z, point.y,
                  -sy * point.x + cy * point.z);
-    gl_Position = vec4(point.xy * viewport_scale, 0.0, 1.0);
+    gl_Position = vec4(
+        point.xy * viewport_scale * zoom + view_offset, 0.0, 1.0
+    );
 }
 """
 
@@ -225,6 +229,9 @@ class STLViewer(pyglet.window.Window):
         self.rot_y = -30.0
         self.flat_rot_x = 0.0
         self.flat_rot_y = 0.0
+        self.flat_pan_x = 0.0
+        self.flat_pan_y = 0.0
+        self.flat_zoom = 1.0
         self.keys = key.KeyStateHandler()
         self.push_handlers(self.keys)
         self.pan_x = self.pan_y = 0.0
@@ -385,6 +392,9 @@ class STLViewer(pyglet.window.Window):
                     self.flatten_elapsed = 0.0
                     self.flat_rot_x = 0.0
                     self.flat_rot_y = 0.0
+                    self.flat_pan_x = 0.0
+                    self.flat_pan_y = 0.0
+                    self.flat_zoom = 1.0
                     self.button.color = (150, 70, 55)
                     self.button_label.text = "Back to 3D"
                     self.flatten_note = (
@@ -499,6 +509,8 @@ class STLViewer(pyglet.window.Window):
         self.flat_program["viewport_scale"] = scale
         self.flat_program["rotation_x"] = math.radians(self.flat_rot_x)
         self.flat_program["rotation_y"] = math.radians(self.flat_rot_y)
+        self.flat_program["zoom"] = self.flat_zoom
+        self.flat_program["view_offset"] = (self.flat_pan_x, self.flat_pan_y)
         self.flat_program["color"] = (0.07, 0.25, 0.42, 1.0)
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
         self.flat_vertex_list.draw(GL_TRIANGLES)
@@ -514,7 +526,13 @@ class STLViewer(pyglet.window.Window):
         self.flat_program.stop()
 
     def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers) -> None:
-        if self.mode != "3d":
+        if self.mode in {"flattening", "relaxing", "flat"}:
+            if buttons & mouse.LEFT:
+                self.flat_rot_y += dx * 0.5
+                self.flat_rot_x -= dy * 0.5
+            if buttons & mouse.RIGHT:
+                self.flat_pan_x += 2.0 * dx / max(1, self.width)
+                self.flat_pan_y += 2.0 * dy / max(1, self.height)
             return
         if buttons & mouse.LEFT:
             self.rot_y += dx * 0.5
@@ -537,13 +555,17 @@ class STLViewer(pyglet.window.Window):
                 self._return_to_3d()
 
     def on_mouse_scroll(self, x, y, scroll_x, scroll_y) -> None:
-        if self.mode == "3d":
+        if self.mode in {"flattening", "relaxing", "flat"}:
+            self.flat_zoom = float(
+                np.clip(self.flat_zoom * (1.1**scroll_y), 0.1, 10.0)
+            )
+        else:
             self.distance = max(self.model_size * 0.05, self.distance * (0.9**scroll_y))
 
     def on_key_press(self, symbol, modifiers) -> None:
-        if symbol == key.R and self.mode == "3d":
+        if symbol == key.R and self.mode in {"3d", "building"}:
             self._reset()
-        elif symbol == key.F and self.mode == "3d":
+        elif symbol == key.F and self.mode in {"3d", "building"}:
             self.wireframe = not self.wireframe
         elif symbol == key.ESCAPE:
             self.close()
