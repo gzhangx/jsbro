@@ -72,6 +72,8 @@ class MeshFlattenTests(unittest.TestCase):
         self.assertEqual(euler, 1)
         self.assertEqual(len(topology.boundary), len(self.disk.boundary))
         self.assertGreater(len(self.disk.boundary), 2)
+        self.assertIsNotNone(self.disk.cut_direction)
+        self.assertAlmostEqual(np.linalg.norm(self.disk.cut_direction), 1.0)
 
     def test_boundary_maps_to_unit_circle(self):
         positions = circular_boundary_positions(self.disk)
@@ -82,6 +84,8 @@ class MeshFlattenTests(unittest.TestCase):
     def test_spring_embedding_converges(self):
         solver = SpringEmbedding(self.disk, np.random.default_rng(5))
         self.assertTrue(np.all(np.isfinite(solver.target)))
+        self.assertGreaterEqual(solver.flatten_layer.min(), 0.0)
+        self.assertLessEqual(solver.flatten_layer.max(), 1.0)
         for _ in range(1000):
             solver.step(1.0 / 60.0)
         self.assertTrue(solver.settled)

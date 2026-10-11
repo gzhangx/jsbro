@@ -46,6 +46,7 @@ class CutDisk:
     faces: IntArray
     boundary: IntArray
     used_fallback: bool = False
+    cut_direction: FloatArray | None = None
 
 
 def index_triangle_soup(points: NDArray[np.floating]) -> IndexedMesh:
@@ -111,7 +112,7 @@ def _remove_random_patch(
     mesh: IndexedMesh,
     rng: np.random.Generator,
     patch_fraction: float,
-) -> IndexedMesh:
+) -> tuple[IndexedMesh, FloatArray]:
     topology = build_edge_topology(mesh.faces, len(mesh.vertices))
     if np.any(topology.counts > 2):
         raise ValueError("non-manifold edges are not supported")
@@ -133,7 +134,13 @@ def _remove_random_patch(
         remaining = dual[keep][:, keep]
         components, _ = connected_components(remaining, directed=False)
         if components == 1:
-            return _compact_mesh(mesh.vertices, mesh.faces[keep])
+            patch_center = mesh.vertices[mesh.faces[~keep]].mean(axis=(0, 1))
+            direction = patch_center - mesh.vertices.mean(axis=0)
+            length = np.linalg.norm(direction)
+            if length < 1e-12:
+                direction = rng.normal(size=3)
+                length = np.linalg.norm(direction)
+            return _compact_mesh(mesh.vertices, mesh.faces[keep]), direction / length
     raise ValueError("could not grow a connected random cut patch")
 
 
@@ -340,11 +347,13 @@ def make_random_cut_disk(
 ) -> CutDisk:
     """Remove a random patch and cut any remaining topology into one disk."""
     rng = rng or np.random.default_rng()
-    opened = _remove_random_patch(mesh, rng, patch_fraction)
+    opened, cut_direction = _remove_random_patch(mesh, rng, patch_fraction)
     try:
-        return _tree_cotree_disk(opened)
+        disk = _tree_cotree_disk(opened)
     except ValueError:
-        return _dual_tree_disk(opened)
+        disk = _dual_tree_disk(opened)
+    disk.cut_direction = cut_direction
+    return disk
 
 
 def circular_boundary_positions(disk: CutDisk) -> FloatArray:
@@ -380,9 +389,26 @@ class SpringEmbedding:
         self.interior = np.flatnonzero(~self.boundary_mask)
 
         centered = disk.vertices - disk.vertices.mean(axis=0)
-        covariance = centered.T @ centered / max(1, len(centered))
-        _, axes = np.linalg.eigh(covariance)
-        projected = centered @ axes[:, -2:]
+        z_axis = (
+            np.asarray(disk.cut_direction, dtype=np.float64)
+            if disk.cut_direction is not None
+            else self.rng.normal(size=3)
+        )
+        z_axis /= max(np.linalg.norm(z_axis), 1e-12)
+        reference = (
+            np.array((0.0, 0.0, 1.0))
+            if abs(z_axis[2]) < 0.9
+            else np.array((0.0, 1.0, 0.0))
+        )
+        x_axis = np.cross(reference, z_axis)
+        x_axis /= max(np.linalg.norm(x_axis), 1e-12)
+        y_axis = np.cross(z_axis, x_axis)
+        rotated = centered @ np.column_stack((x_axis, y_axis, z_axis))
+        projected = rotated[:, :2]
+        z_values = rotated[:, 2]
+        self.flatten_layer = (z_values - z_values.min()) / max(
+            np.ptp(z_values), 1e-12
+        )
         radius = np.linalg.norm(projected, axis=1).max(initial=1.0)
         normalized_projection = projected / max(radius, 1e-12)
         # Duplicate seam vertices begin at the same projected 3D location.

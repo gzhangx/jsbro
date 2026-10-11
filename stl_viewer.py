@@ -59,6 +59,8 @@ Vec3 = tuple[float, float, float]
 # 1.0 = normal speed, 0.5 = half speed, 0.25 = quarter speed.
 BOUNCE_SPEED = 0.4
 FLATTEN_DURATION_SECONDS = 4.0
+# Fraction of the Z sweep over which each layer is pulled outward.
+FLATTEN_LAYER_BLEND = 0.18
 
 
 VERTEX_SHADER = """#version 330 core
@@ -324,20 +326,33 @@ class STLViewer(pyglet.window.Window):
                     self.flatten_note = (
                         " (fallback seams)" if self.solver.disk.used_fallback else ""
                     )
-                    self.status_message = f"Flattening cut{self.flatten_note}... 0%"
+                    self.status_message = (
+                        f"Z-sweep flattening{self.flatten_note}... 0%"
+                    )
                 finally:
                     self.flatten_future = None
         elif self.mode == "flattening" and self.solver is not None:
             self.flatten_elapsed += min(dt, 1.0 / 20.0)
             progress = min(1.0, self.flatten_elapsed / self.flatten_duration)
-            eased = progress * progress * (3.0 - 2.0 * progress)
+            layer_start = (1.0 - self.solver.flatten_layer) * (
+                1.0 - FLATTEN_LAYER_BLEND
+            )
+            layer_progress = np.clip(
+                (progress - layer_start) / FLATTEN_LAYER_BLEND, 0.0, 1.0
+            )
+            eased = (
+                layer_progress
+                * layer_progress
+                * (3.0 - 2.0 * layer_progress)
+            )[:, None]
             positions = (
                 (1.0 - eased) * self.solver.flatten_start_positions
                 + eased * self.solver.positions
             )
             self._sync_flat_positions(positions)
             self.status_message = (
-                f"Flattening cut{self.flatten_note}... {round(progress * 100):d}%"
+                f"Z-sweep flattening{self.flatten_note}... "
+                f"{round(progress * 100):d}%"
             )
             if progress >= 1.0:
                 self.mode = "relaxing"
