@@ -440,10 +440,11 @@ class STLViewer(pyglet.window.Window):
             circle_scale = (
                 FLATTEN_START_SCALE + (1.0 - FLATTEN_START_SCALE) * expansion
             )
+            sweep_height = (1.0 - progress) * self.solver.flatten_max_z
             flat_target = np.column_stack(
                 (
                     self.solver.initial_positions * circle_scale,
-                    np.zeros(len(self.solver.positions)),
+                    np.full(len(self.solver.positions), sweep_height),
                 )
             )
             positions = (

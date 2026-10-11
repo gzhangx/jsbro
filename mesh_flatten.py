@@ -446,6 +446,7 @@ class SpringEmbedding:
         self.flatten_start_positions = (
             rotated / max(model_radius, 1e-12) * 0.72
         )
+        self.flatten_max_z = float(self.flatten_start_positions[:, 2].max())
         self.positions = normalized_projection * 0.45
         self.positions += self.rng.normal(0.0, 0.015, self.positions.shape)
         self.positions[disk.boundary] = self.boundary_positions

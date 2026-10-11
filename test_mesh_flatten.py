@@ -92,6 +92,9 @@ class MeshFlattenTests(unittest.TestCase):
         self.assertLessEqual(solver.flatten_layer.max(), 1.0)
         self.assertAlmostEqual(solver.flatten_start_positions[:, 2].min(), 0.0)
         self.assertTrue(np.all(solver.flatten_start_positions[:, 2] >= 0.0))
+        self.assertAlmostEqual(
+            solver.flatten_start_positions[:, 2].max(), solver.flatten_max_z
+        )
         for _ in range(1000):
             solver.step(1.0 / 60.0)
         self.assertTrue(solver.settled)
