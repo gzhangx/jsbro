@@ -437,8 +437,17 @@ class SpringEmbedding:
         self.positions = normalized_projection * 0.45
         self.positions += self.rng.normal(0.0, 0.015, self.positions.shape)
         self.positions[disk.boundary] = self.boundary_positions
+        self.initial_positions = self.positions.copy()
         self.velocity = np.zeros_like(self.positions)
         self.target = self._solve_equilibrium()
+        self.energy = float("inf")
+        self.settled = len(self.interior) == 0
+        self.elapsed = 0.0
+
+    def reset_animation(self) -> None:
+        """Restore the pre-relaxation state so the full animation can replay."""
+        self.positions[:] = self.initial_positions
+        self.velocity.fill(0.0)
         self.energy = float("inf")
         self.settled = len(self.interior) == 0
         self.elapsed = 0.0

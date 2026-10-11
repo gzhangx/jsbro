@@ -268,6 +268,17 @@ class STLViewer(pyglet.window.Window):
             anchor_y="center",
             font_size=11,
         )
+        self.replay_button = pyglet.shapes.Rectangle(
+            267, self.height - 58, 165, 38, color=(70, 126, 82)
+        )
+        self.replay_label = pyglet.text.Label(
+            "Replay Animation",
+            x=self.replay_button.x + self.replay_button.width / 2,
+            y=self.replay_button.y + self.replay_button.height / 2,
+            anchor_x="center",
+            anchor_y="center",
+            font_size=11,
+        )
         self.status_label = pyglet.text.Label(
             self.status_message,
             x=20,
@@ -353,6 +364,15 @@ class STLViewer(pyglet.window.Window):
         self.flatten_note = ""
         self.button.color = (42, 112, 178)
         self.button_label.text = "Cut From Current View"
+
+    def _replay_animation(self) -> None:
+        if self.solver is None or self.mode not in {"flattening", "relaxing", "flat"}:
+            return
+        self.solver.reset_animation()
+        self.flatten_elapsed = 0.0
+        self.mode = "flattening"
+        self._sync_flat_positions(self.solver.flatten_start_positions)
+        self.status_message = f"Z-sweep flattening{self.flatten_note}... 0%"
 
     def _update_keyboard_rotation(self, dt: float) -> None:
         amount = KEY_ROTATION_SPEED * min(dt, 1.0 / 20.0)
@@ -460,6 +480,13 @@ class STLViewer(pyglet.window.Window):
             self.button.y = height - 58
             self.button_label.x = self.button.x + self.button.width / 2
             self.button_label.y = self.button.y + self.button.height / 2
+            self.replay_button.y = height - 58
+            self.replay_label.x = (
+                self.replay_button.x + self.replay_button.width / 2
+            )
+            self.replay_label.y = (
+                self.replay_button.y + self.replay_button.height / 2
+            )
             self.status_label.y = height - 78
         return result
 
@@ -472,6 +499,9 @@ class STLViewer(pyglet.window.Window):
         glDisable(GL_DEPTH_TEST)
         self.button.draw()
         self.button_label.draw()
+        if self.mode in {"flattening", "relaxing", "flat"}:
+            self.replay_button.draw()
+            self.replay_label.draw()
         self.status_label.draw()
 
     def _draw_3d(self) -> None:
@@ -544,6 +574,17 @@ class STLViewer(pyglet.window.Window):
 
     def on_mouse_press(self, x, y, button, modifiers) -> None:
         if button != mouse.LEFT:
+            return
+        if (
+            self.mode in {"flattening", "relaxing", "flat"}
+            and self.replay_button.x
+            <= x
+            <= self.replay_button.x + self.replay_button.width
+            and self.replay_button.y
+            <= y
+            <= self.replay_button.y + self.replay_button.height
+        ):
+            self._replay_animation()
             return
         if (
             self.button.x <= x <= self.button.x + self.button.width
