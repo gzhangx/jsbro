@@ -105,6 +105,13 @@ class MeshFlattenTests(unittest.TestCase):
         self.assertFalse(solver.settled)
         self.assertEqual(solver.elapsed, 0.0)
         np.testing.assert_allclose(solver.positions, solver.initial_positions)
+        solver.set_animation_time(5.0)
+        position_at_five = solver.positions.copy()
+        solver.set_animation_time(2.0)
+        self.assertEqual(solver.elapsed, 2.0)
+        self.assertFalse(np.allclose(solver.positions, position_at_five))
+        solver.set_animation_time(0.0)
+        np.testing.assert_allclose(solver.positions, solver.initial_positions)
 
 
 if __name__ == "__main__":

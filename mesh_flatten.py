@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import math
 
 import numpy as np
 from numpy.typing import NDArray
@@ -390,6 +391,8 @@ def circular_boundary_positions(disk: CutDisk) -> FloatArray:
 class SpringEmbedding:
     """Animated damped spring relaxation toward a Tutte equilibrium."""
 
+    animation_duration = 14.0
+
     def __init__(self, disk: CutDisk, rng: np.random.Generator | None = None) -> None:
         self.disk = disk
         self.rng = rng or np.random.default_rng()
@@ -449,6 +452,9 @@ class SpringEmbedding:
         self.initial_positions = self.positions.copy()
         self.velocity = np.zeros_like(self.positions)
         self.target = self._solve_equilibrium()
+        self.bounce_frequency = self.rng.uniform(
+            2.2, 3.2, (len(self.positions), 1)
+        )
         self.energy = float("inf")
         self.settled = len(self.interior) == 0
         self.elapsed = 0.0
@@ -487,27 +493,28 @@ class SpringEmbedding:
     def step(self, dt: float) -> None:
         if self.settled:
             return
-        dt = min(max(dt, 0.0), 1.0 / 20.0)
-        spring_force = self.average @ self.positions - self.positions
-        target_force = self.target - self.positions
-        acceleration = (
-            18.0 * spring_force + 6.0 * target_force - 2.0 * self.velocity
-        )
-        acceleration[self.boundary_mask] = 0.0
-        self.velocity += acceleration * dt
-        self.positions += self.velocity * dt
-        self.positions[self.disk.boundary] = self.boundary_positions
-        self.velocity[self.boundary_mask] = 0.0
-        self.elapsed += dt
-        difference = self.target - self.positions
-        self.energy = float(np.sqrt(np.mean(difference[self.interior] ** 2)))
-        speed = float(np.max(np.linalg.norm(self.velocity[self.interior], axis=1), initial=0.0))
-        if (
-            self.elapsed > 2.5
-            and self.energy < 2e-4
-            and speed < 2e-3
-        ) or self.elapsed > 14.0:
+        self.set_animation_time(self.elapsed + min(max(dt, 0.0), 1.0 / 20.0))
+
+    def set_animation_time(self, elapsed: float) -> None:
+        """Seek the damped spring animation to an exact solver time."""
+        self.elapsed = float(np.clip(elapsed, 0.0, self.animation_duration))
+        if self.elapsed >= self.animation_duration:
             self.positions[:] = self.target
             self.velocity.fill(0.0)
             self.energy = 0.0
             self.settled = True
+            return
+        decay = math.exp(-0.32 * self.elapsed)
+        phase = self.bounce_frequency * self.elapsed
+        response = decay * np.cos(phase)
+        difference = self.initial_positions - self.target
+        self.positions[:] = self.target + difference * response
+        self.positions[self.disk.boundary] = self.boundary_positions
+        velocity_factor = decay * (
+            -0.32 * np.cos(phase) - self.bounce_frequency * np.sin(phase)
+        )
+        self.velocity[:] = difference * velocity_factor
+        self.velocity[self.boundary_mask] = 0.0
+        remaining = self.target - self.positions
+        self.energy = float(np.sqrt(np.mean(remaining[self.interior] ** 2)))
+        self.settled = False

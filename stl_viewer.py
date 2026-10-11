@@ -247,6 +247,9 @@ class STLViewer(pyglet.window.Window):
         self.flatten_elapsed = 0.0
         self.flatten_duration = FLATTEN_DURATION_SECONDS
         self.flatten_note = ""
+        self.timeline_time = 0.0
+        self.playing = False
+        self.slider_dragging = False
         self.projection_matrix = Mat4.perspective_projection(
             self.width / max(1, self.height),
             self.model_size / 1000,
@@ -278,6 +281,26 @@ class STLViewer(pyglet.window.Window):
             anchor_x="center",
             anchor_y="center",
             font_size=11,
+        )
+        self.play_button = pyglet.shapes.Rectangle(
+            444, self.height - 58, 110, 38, color=(124, 88, 164)
+        )
+        self.play_label = pyglet.text.Label(
+            "Pause",
+            x=self.play_button.x + self.play_button.width / 2,
+            y=self.play_button.y + self.play_button.height / 2,
+            anchor_x="center",
+            anchor_y="center",
+            font_size=11,
+        )
+        self.slider_track = pyglet.shapes.Rectangle(
+            20, 25, max(100, self.width - 40), 6, color=(74, 78, 88)
+        )
+        self.slider_fill = pyglet.shapes.Rectangle(
+            20, 25, 0, 6, color=(72, 155, 220)
+        )
+        self.slider_knob = pyglet.shapes.Circle(
+            20, 28, 9, color=(225, 232, 242)
         )
         self.status_label = pyglet.text.Label(
             self.status_message,
@@ -364,6 +387,9 @@ class STLViewer(pyglet.window.Window):
         self.status_message = "Rotate with W/A/S/D, then cut from the current view"
         self.flatten_elapsed = 0.0
         self.flatten_note = ""
+        self.timeline_time = 0.0
+        self.playing = False
+        self.slider_dragging = False
         self.button.color = (42, 112, 178)
         self.button_label.text = "Cut From Current View"
 
@@ -371,10 +397,100 @@ class STLViewer(pyglet.window.Window):
         if self.solver is None or self.mode not in {"flattening", "relaxing", "flat"}:
             return
         self.solver.reset_animation()
-        self.flatten_elapsed = 0.0
-        self.mode = "flattening"
-        self._sync_flat_positions(self.solver.flatten_start_positions)
-        self.status_message = f"Z-sweep flattening{self.flatten_note}... 0%"
+        self.timeline_time = 0.0
+        self.playing = True
+        self._apply_timeline_time()
+
+    def _timeline_duration(self) -> float:
+        if self.solver is None:
+            return self.flatten_duration
+        return (
+            self.flatten_duration
+            + self.solver.animation_duration / max(BOUNCE_SPEED, 1e-6)
+        )
+
+    def _update_slider_visual(self) -> None:
+        duration = self._timeline_duration()
+        progress = float(np.clip(self.timeline_time / duration, 0.0, 1.0))
+        width = self.slider_track.width * progress
+        self.slider_fill.width = width
+        self.slider_knob.x = self.slider_track.x + width
+        self.play_label.text = "Pause" if self.playing else "Play"
+
+    def _apply_timeline_time(self) -> None:
+        if self.solver is None:
+            return
+        total = self._timeline_duration()
+        self.timeline_time = float(np.clip(self.timeline_time, 0.0, total))
+        if self.timeline_time <= self.flatten_duration:
+            self.mode = "flattening"
+            progress = self.timeline_time / self.flatten_duration
+            layer_start = (1.0 - self.solver.flatten_layer) * (
+                1.0 - FLATTEN_LAYER_BLEND
+            )
+            layer_progress = np.clip(
+                (progress - layer_start) / FLATTEN_LAYER_BLEND, 0.0, 1.0
+            )
+            eased = (
+                layer_progress
+                * layer_progress
+                * (3.0 - 2.0 * layer_progress)
+            )[:, None]
+            expansion = progress * progress * (3.0 - 2.0 * progress)
+            circle_scale = (
+                FLATTEN_START_SCALE + (1.0 - FLATTEN_START_SCALE) * expansion
+            )
+            flat_target = np.column_stack(
+                (
+                    self.solver.initial_positions * circle_scale,
+                    np.zeros(len(self.solver.positions)),
+                )
+            )
+            positions = (
+                (1.0 - eased) * self.solver.flatten_start_positions
+                + eased * flat_target
+            )
+            self._sync_flat_positions(positions)
+            self.status_message = (
+                f"Z-sweep flattening{self.flatten_note}... "
+                f"{round(progress * 100):d}%"
+            )
+        else:
+            solver_time = (
+                self.timeline_time - self.flatten_duration
+            ) * BOUNCE_SPEED
+            self.solver.set_animation_time(solver_time)
+            self._sync_flat_positions()
+            if self.solver.settled:
+                self.mode = "flat"
+                self.playing = False
+                self.status_message = "Laplacian equilibrium settled"
+            else:
+                self.mode = "relaxing"
+                self.status_message = f"Spring error: {self.solver.energy:.6f}"
+        if not self.playing and self.mode != "flat":
+            self.status_message += " (paused)"
+        self._update_slider_visual()
+        self.status_label.text = self.status_message
+
+    def _toggle_playback(self) -> None:
+        if self.solver is None:
+            return
+        if self.timeline_time >= self._timeline_duration():
+            self.timeline_time = 0.0
+            self.solver.reset_animation()
+        self.playing = not self.playing
+        self._apply_timeline_time()
+
+    def _seek_from_slider(self, x: float) -> None:
+        progress = np.clip(
+            (x - self.slider_track.x) / max(1.0, self.slider_track.width),
+            0.0,
+            1.0,
+        )
+        self.timeline_time = float(progress * self._timeline_duration())
+        self.playing = False
+        self._apply_timeline_time()
 
     def _update_keyboard_rotation(self, dt: float) -> None:
         amount = KEY_ROTATION_SPEED * min(dt, 1.0 / 20.0)
@@ -410,8 +526,6 @@ class STLViewer(pyglet.window.Window):
                     self.button.color = (42, 112, 178)
                     self.status_message = f"Could not flatten mesh: {exc}"
                 else:
-                    self.mode = "flattening"
-                    self.flatten_elapsed = 0.0
                     self.flat_rot_x = 0.0
                     self.flat_rot_y = 0.0
                     self.flat_pan_x = 0.0
@@ -422,54 +536,15 @@ class STLViewer(pyglet.window.Window):
                     self.flatten_note = (
                         " (fallback seams)" if self.solver.disk.used_fallback else ""
                     )
-                    self.status_message = (
-                        f"Z-sweep flattening{self.flatten_note}... 0%"
-                    )
+                    self.timeline_time = 0.0
+                    self.playing = True
+                    self._apply_timeline_time()
                 finally:
                     self.flatten_future = None
-        elif self.mode == "flattening" and self.solver is not None:
-            self.flatten_elapsed += min(dt, 1.0 / 20.0)
-            progress = min(1.0, self.flatten_elapsed / self.flatten_duration)
-            layer_start = (1.0 - self.solver.flatten_layer) * (
-                1.0 - FLATTEN_LAYER_BLEND
-            )
-            layer_progress = np.clip(
-                (progress - layer_start) / FLATTEN_LAYER_BLEND, 0.0, 1.0
-            )
-            eased = (
-                layer_progress
-                * layer_progress
-                * (3.0 - 2.0 * layer_progress)
-            )[:, None]
-            expansion = progress * progress * (3.0 - 2.0 * progress)
-            circle_scale = (
-                FLATTEN_START_SCALE + (1.0 - FLATTEN_START_SCALE) * expansion
-            )
-            flat_target = np.column_stack(
-                (
-                    self.solver.positions * circle_scale,
-                    np.zeros(len(self.solver.positions)),
-                )
-            )
-            positions = (
-                (1.0 - eased) * self.solver.flatten_start_positions
-                + eased * flat_target
-            )
-            self._sync_flat_positions(positions)
-            self.status_message = (
-                f"Z-sweep flattening{self.flatten_note}... "
-                f"{round(progress * 100):d}%"
-            )
-            if progress >= 1.0:
-                self.mode = "relaxing"
-                self.status_message = f"Springs relaxing{self.flatten_note}..."
-        elif self.mode == "relaxing" and self.solver is not None:
-            self.solver.step(dt * BOUNCE_SPEED)
-            self._sync_flat_positions()
-            self.status_message = f"Spring error: {self.solver.energy:.6f}"
-            if self.solver.settled:
-                self.mode = "flat"
-                self.status_message = "Laplacian equilibrium settled"
+        elif self.mode in {"flattening", "relaxing", "flat"} and self.solver is not None:
+            if self.playing:
+                self.timeline_time += min(dt, 1.0 / 20.0)
+                self._apply_timeline_time()
         self.status_label.text = self.status_message
 
     def _reset(self) -> None:
@@ -495,6 +570,11 @@ class STLViewer(pyglet.window.Window):
             self.replay_label.y = (
                 self.replay_button.y + self.replay_button.height / 2
             )
+            self.play_button.y = height - 58
+            self.play_label.x = self.play_button.x + self.play_button.width / 2
+            self.play_label.y = self.play_button.y + self.play_button.height / 2
+            self.slider_track.width = max(100, width - 40)
+            self._update_slider_visual()
             self.status_label.y = height - 78
         return result
 
@@ -510,6 +590,11 @@ class STLViewer(pyglet.window.Window):
         if self.mode in {"flattening", "relaxing", "flat"}:
             self.replay_button.draw()
             self.replay_label.draw()
+            self.play_button.draw()
+            self.play_label.draw()
+            self.slider_track.draw()
+            self.slider_fill.draw()
+            self.slider_knob.draw()
         self.status_label.draw()
 
     def _draw_3d(self) -> None:
@@ -565,6 +650,9 @@ class STLViewer(pyglet.window.Window):
         self.flat_program.stop()
 
     def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers) -> None:
+        if self.slider_dragging:
+            self._seek_from_slider(x)
+            return
         if self.mode in {"flattening", "relaxing", "flat"}:
             if buttons & mouse.LEFT:
                 self.flat_rot_y += dx * 0.5
@@ -584,8 +672,32 @@ class STLViewer(pyglet.window.Window):
     def on_mouse_press(self, x, y, button, modifiers) -> None:
         if button != mouse.LEFT:
             return
+        animated = self.mode in {"flattening", "relaxing", "flat"}
         if (
-            self.mode in {"flattening", "relaxing", "flat"}
+            animated
+            and self.slider_track.x - 10
+            <= x
+            <= self.slider_track.x + self.slider_track.width + 10
+            and self.slider_track.y - 14
+            <= y
+            <= self.slider_track.y + self.slider_track.height + 14
+        ):
+            self.slider_dragging = True
+            self._seek_from_slider(x)
+            return
+        if (
+            animated
+            and self.play_button.x
+            <= x
+            <= self.play_button.x + self.play_button.width
+            and self.play_button.y
+            <= y
+            <= self.play_button.y + self.play_button.height
+        ):
+            self._toggle_playback()
+            return
+        if (
+            animated
             and self.replay_button.x
             <= x
             <= self.replay_button.x + self.replay_button.width
@@ -603,6 +715,10 @@ class STLViewer(pyglet.window.Window):
                 self._start_flattening()
             elif self.mode in {"flattening", "relaxing", "flat"}:
                 self._return_to_3d()
+
+    def on_mouse_release(self, x, y, button, modifiers) -> None:
+        if button == mouse.LEFT:
+            self.slider_dragging = False
 
     def on_mouse_scroll(self, x, y, scroll_x, scroll_y) -> None:
         if self.mode in {"flattening", "relaxing", "flat"}:
