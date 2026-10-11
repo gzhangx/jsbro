@@ -112,6 +112,7 @@ def _remove_random_patch(
     mesh: IndexedMesh,
     rng: np.random.Generator,
     patch_fraction: float,
+    cut_direction: NDArray[np.floating] | None = None,
 ) -> tuple[IndexedMesh, FloatArray]:
     topology = build_edge_topology(mesh.faces, len(mesh.vertices))
     if np.any(topology.counts > 2):
@@ -123,9 +124,23 @@ def _remove_random_patch(
         1,
         min(2000, len(mesh.faces) - 1, int(len(mesh.faces) * patch_fraction)),
     )
+    selected_direction: FloatArray | None = None
+    ranked_seeds: IntArray | None = None
+    if cut_direction is not None:
+        selected_direction = np.asarray(cut_direction, dtype=np.float64)
+        length = np.linalg.norm(selected_direction)
+        if length < 1e-12:
+            raise ValueError("cut direction cannot be zero")
+        selected_direction /= length
+        face_centers = mesh.vertices[mesh.faces].mean(axis=1)
+        ranked_seeds = np.argsort(face_centers @ selected_direction)[::-1]
 
-    for _ in range(12):
-        seed = int(rng.integers(len(mesh.faces)))
+    for attempt in range(12):
+        if ranked_seeds is None:
+            seed = int(rng.integers(len(mesh.faces)))
+        else:
+            seed_index = min(attempt * max(1, target // 4), len(ranked_seeds) - 1)
+            seed = int(ranked_seeds[seed_index])
         order = breadth_first_order(dual, seed, directed=False, return_predecessors=False)
         if len(order) <= target:
             continue
@@ -134,13 +149,15 @@ def _remove_random_patch(
         remaining = dual[keep][:, keep]
         components, _ = connected_components(remaining, directed=False)
         if components == 1:
-            patch_center = mesh.vertices[mesh.faces[~keep]].mean(axis=(0, 1))
-            direction = patch_center - mesh.vertices.mean(axis=0)
-            length = np.linalg.norm(direction)
-            if length < 1e-12:
-                direction = rng.normal(size=3)
+            if selected_direction is None:
+                patch_center = mesh.vertices[mesh.faces[~keep]].mean(axis=(0, 1))
+                direction = patch_center - mesh.vertices.mean(axis=0)
                 length = np.linalg.norm(direction)
-            return _compact_mesh(mesh.vertices, mesh.faces[keep]), direction / length
+                if length < 1e-12:
+                    direction = rng.normal(size=3)
+                    length = np.linalg.norm(direction)
+                selected_direction = direction / length
+            return _compact_mesh(mesh.vertices, mesh.faces[keep]), selected_direction
     raise ValueError("could not grow a connected random cut patch")
 
 
@@ -344,15 +361,18 @@ def make_random_cut_disk(
     *,
     rng: np.random.Generator | None = None,
     patch_fraction: float = 0.005,
+    cut_direction: NDArray[np.floating] | None = None,
 ) -> CutDisk:
-    """Remove a random patch and cut any remaining topology into one disk."""
+    """Remove a directed or random patch and cut the remaining surface to a disk."""
     rng = rng or np.random.default_rng()
-    opened, cut_direction = _remove_random_patch(mesh, rng, patch_fraction)
+    opened, selected_direction = _remove_random_patch(
+        mesh, rng, patch_fraction, cut_direction
+    )
     try:
         disk = _tree_cotree_disk(opened)
     except ValueError:
         disk = _dual_tree_disk(opened)
-    disk.cut_direction = cut_direction
+    disk.cut_direction = selected_direction
     return disk
 
 

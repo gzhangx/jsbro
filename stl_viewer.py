@@ -5,12 +5,13 @@ Usage:
     python stl_viewer.py path/to/model.stl
 
 Controls:
-    Button          Randomly cut and flatten / return to 3D
+    Button          Cut from the current view / return to 3D
+    W/A/S/D         Rotate in 3D, while flattening, or while bouncing
     Left drag       Rotate
     Right drag      Pan
     Mouse wheel     Zoom
     R               Reset the view
-    W               Toggle wireframe
+    F               Toggle wireframe
     Escape          Close
 """
 
@@ -61,6 +62,8 @@ BOUNCE_SPEED = 0.4
 FLATTEN_DURATION_SECONDS = 4.0
 # Fraction of the Z sweep over which each layer is pulled outward.
 FLATTEN_LAYER_BLEND = 0.18
+FLATTEN_START_SCALE = 0.08
+KEY_ROTATION_SPEED = 65.0
 
 
 VERTEX_SHADER = """#version 330 core
@@ -100,10 +103,21 @@ void main()
 FLAT_VERTEX_SHADER = """#version 330 core
 in vec2 position;
 uniform vec2 viewport_scale;
+uniform float rotation_x;
+uniform float rotation_y;
 
 void main()
 {
-    gl_Position = vec4(position * viewport_scale, 0.0, 1.0);
+    float cx = cos(rotation_x);
+    float sx = sin(rotation_x);
+    float cy = cos(rotation_y);
+    float sy = sin(rotation_y);
+    vec3 point = vec3(position, 0.0);
+    point = vec3(point.x, cx * point.y - sx * point.z,
+                 sx * point.y + cx * point.z);
+    point = vec3(cy * point.x + sy * point.z, point.y,
+                 -sy * point.x + cy * point.z);
+    gl_Position = vec4(point.xy * viewport_scale, 0.0, 1.0);
 }
 """
 
@@ -209,6 +223,10 @@ class STLViewer(pyglet.window.Window):
 
         self.rot_x = 20.0
         self.rot_y = -30.0
+        self.flat_rot_x = 0.0
+        self.flat_rot_y = 0.0
+        self.keys = key.KeyStateHandler()
+        self.push_handlers(self.keys)
         self.pan_x = self.pan_y = 0.0
         self.distance = self.model_size * 2.8
         self.wireframe = False
@@ -218,7 +236,7 @@ class STLViewer(pyglet.window.Window):
         self.boundary_vertex_list = None
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mesh-cut")
         self.flatten_future: Future[SpringEmbedding] | None = None
-        self.status_message = ""
+        self.status_message = "Rotate with W/A/S/D, then cut from the current view"
         self.flatten_elapsed = 0.0
         self.flatten_duration = FLATTEN_DURATION_SECONDS
         self.flatten_note = ""
@@ -236,7 +254,7 @@ class STLViewer(pyglet.window.Window):
             20, self.height - 58, 235, 38, color=(42, 112, 178)
         )
         self.button_label = pyglet.text.Label(
-            "Random Cut & Flatten",
+            "Cut From Current View",
             x=self.button.x + self.button.width / 2,
             y=self.button.y + self.button.height / 2,
             anchor_x="center",
@@ -244,7 +262,7 @@ class STLViewer(pyglet.window.Window):
             font_size=11,
         )
         self.status_label = pyglet.text.Label(
-            "",
+            self.status_message,
             x=20,
             y=self.height - 78,
             anchor_x="left",
@@ -255,20 +273,41 @@ class STLViewer(pyglet.window.Window):
         pyglet.clock.schedule_interval(self._update, 1.0 / 60.0)
 
     @staticmethod
-    def _prepare_flattening(mesh: IndexedMesh, seed: int) -> SpringEmbedding:
+    def _prepare_flattening(
+        mesh: IndexedMesh, seed: int, cut_direction: np.ndarray
+    ) -> SpringEmbedding:
         rng = np.random.default_rng(seed)
-        disk = make_random_cut_disk(mesh, rng=rng)
+        disk = make_random_cut_disk(mesh, rng=rng, cut_direction=cut_direction)
         return SpringEmbedding(disk, rng)
+
+    def _current_cut_direction(self) -> np.ndarray:
+        rx, ry = math.radians(self.rot_x), math.radians(self.rot_y)
+        rotation_x = np.array(
+            (
+                (1.0, 0.0, 0.0),
+                (0.0, math.cos(rx), -math.sin(rx)),
+                (0.0, math.sin(rx), math.cos(rx)),
+            )
+        )
+        rotation_y = np.array(
+            (
+                (math.cos(ry), 0.0, math.sin(ry)),
+                (0.0, 1.0, 0.0),
+                (-math.sin(ry), 0.0, math.cos(ry)),
+            )
+        )
+        return (rotation_x @ rotation_y).T @ np.array((0.0, 0.0, 1.0))
 
     def _start_flattening(self) -> None:
         if self.mode != "3d":
             return
         self.mode = "building"
-        self.status_message = "Building a random topology cut..."
+        self.status_message = "Building cut from the selected view direction..."
         self.button.color = (75, 80, 92)
         seed = int(np.random.default_rng().integers(0, np.iinfo(np.int64).max))
+        cut_direction = self._current_cut_direction()
         self.flatten_future = self.executor.submit(
-            self._prepare_flattening, self.indexed_mesh, seed
+            self._prepare_flattening, self.indexed_mesh, seed, cut_direction
         )
 
     def _create_flat_buffers(self, solver: SpringEmbedding) -> None:
@@ -302,13 +341,36 @@ class STLViewer(pyglet.window.Window):
         self.solver = None
         self.flat_vertex_list = None
         self.boundary_vertex_list = None
-        self.status_message = ""
+        self.status_message = "Rotate with W/A/S/D, then cut from the current view"
         self.flatten_elapsed = 0.0
         self.flatten_note = ""
         self.button.color = (42, 112, 178)
-        self.button_label.text = "Random Cut & Flatten"
+        self.button_label.text = "Cut From Current View"
+
+    def _update_keyboard_rotation(self, dt: float) -> None:
+        amount = KEY_ROTATION_SPEED * min(dt, 1.0 / 20.0)
+        flat_mode = self.mode in {"flattening", "relaxing", "flat"}
+        if flat_mode:
+            if self.keys[key.A]:
+                self.flat_rot_y -= amount
+            if self.keys[key.D]:
+                self.flat_rot_y += amount
+            if self.keys[key.W]:
+                self.flat_rot_x += amount
+            if self.keys[key.S]:
+                self.flat_rot_x -= amount
+        else:
+            if self.keys[key.A]:
+                self.rot_y -= amount
+            if self.keys[key.D]:
+                self.rot_y += amount
+            if self.keys[key.W]:
+                self.rot_x += amount
+            if self.keys[key.S]:
+                self.rot_x -= amount
 
     def _update(self, dt: float) -> None:
+        self._update_keyboard_rotation(dt)
         if self.mode == "building" and self.flatten_future is not None:
             if self.flatten_future.done():
                 try:
@@ -321,6 +383,8 @@ class STLViewer(pyglet.window.Window):
                 else:
                     self.mode = "flattening"
                     self.flatten_elapsed = 0.0
+                    self.flat_rot_x = 0.0
+                    self.flat_rot_y = 0.0
                     self.button.color = (150, 70, 55)
                     self.button_label.text = "Back to 3D"
                     self.flatten_note = (
@@ -345,9 +409,13 @@ class STLViewer(pyglet.window.Window):
                 * layer_progress
                 * (3.0 - 2.0 * layer_progress)
             )[:, None]
+            expansion = progress * progress * (3.0 - 2.0 * progress)
+            circle_scale = (
+                FLATTEN_START_SCALE + (1.0 - FLATTEN_START_SCALE) * expansion
+            )
             positions = (
                 (1.0 - eased) * self.solver.flatten_start_positions
-                + eased * self.solver.positions
+                + eased * (self.solver.positions * circle_scale)
             )
             self._sync_flat_positions(positions)
             self.status_message = (
@@ -429,6 +497,8 @@ class STLViewer(pyglet.window.Window):
         )
         self.flat_program.use()
         self.flat_program["viewport_scale"] = scale
+        self.flat_program["rotation_x"] = math.radians(self.flat_rot_x)
+        self.flat_program["rotation_y"] = math.radians(self.flat_rot_y)
         self.flat_program["color"] = (0.07, 0.25, 0.42, 1.0)
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
         self.flat_vertex_list.draw(GL_TRIANGLES)
@@ -473,7 +543,7 @@ class STLViewer(pyglet.window.Window):
     def on_key_press(self, symbol, modifiers) -> None:
         if symbol == key.R and self.mode == "3d":
             self._reset()
-        elif symbol == key.W and self.mode == "3d":
+        elif symbol == key.F and self.mode == "3d":
             self.wireframe = not self.wireframe
         elif symbol == key.ESCAPE:
             self.close()

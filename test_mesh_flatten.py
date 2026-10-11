@@ -58,7 +58,10 @@ class MeshFlattenTests(unittest.TestCase):
     def setUpClass(cls):
         cls.mesh = index_triangle_soup(sphere_triangle_soup())
         cls.disk = make_random_cut_disk(
-            cls.mesh, rng=np.random.default_rng(1234), patch_fraction=0.08
+            cls.mesh,
+            rng=np.random.default_rng(1234),
+            patch_fraction=0.08,
+            cut_direction=np.array((0.0, 0.0, 1.0)),
         )
 
     def test_triangle_soup_is_welded(self):
@@ -74,6 +77,7 @@ class MeshFlattenTests(unittest.TestCase):
         self.assertGreater(len(self.disk.boundary), 2)
         self.assertIsNotNone(self.disk.cut_direction)
         self.assertAlmostEqual(np.linalg.norm(self.disk.cut_direction), 1.0)
+        np.testing.assert_allclose(self.disk.cut_direction, (0.0, 0.0, 1.0))
 
     def test_boundary_maps_to_unit_circle(self):
         positions = circular_boundary_positions(self.disk)
