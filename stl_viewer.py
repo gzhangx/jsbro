@@ -64,6 +64,8 @@ FLATTEN_DURATION_SECONDS = 4.0
 FLATTEN_LAYER_BLEND = 0.10
 # The unfolded disk starts large enough for long stretch lines, then grows.
 FLATTEN_START_SCALE = 0.72
+# Thickness of the bright band marking the layer about to open, as a fraction of height.
+LAYER_HIGHLIGHT_THICKNESS = 0.035
 KEY_ROTATION_SPEED = 65.0
 
 
@@ -103,11 +105,13 @@ void main()
 
 FLAT_VERTEX_SHADER = """#version 330 core
 in vec3 position;
+in float highlight;
 uniform vec2 viewport_scale;
 uniform float rotation_x;
 uniform float rotation_y;
 uniform float zoom;
 uniform vec2 view_offset;
+out float layer_highlight;
 
 void main()
 {
@@ -116,6 +120,7 @@ void main()
     float cy = cos(rotation_y);
     float sy = sin(rotation_y);
     vec3 point = position;
+    layer_highlight = highlight;
     point = vec3(point.x, cx * point.y - sx * point.z,
                  sx * point.y + cx * point.z);
     point = vec3(cy * point.x + sy * point.z, point.y,
@@ -129,11 +134,13 @@ void main()
 
 FLAT_FRAGMENT_SHADER = """#version 330 core
 uniform vec4 color;
+uniform vec4 highlight_color;
+in float layer_highlight;
 out vec4 final_color;
 
 void main()
 {
-    final_color = color;
+    final_color = mix(color, highlight_color, layer_highlight);
 }
 """
 
@@ -357,17 +364,20 @@ class STLViewer(pyglet.window.Window):
             np.float32, copy=False
         ).reshape(-1)
         indices = solver.disk.faces.astype(np.uint32, copy=False).reshape(-1)
+        highlight = np.zeros(len(solver.positions), dtype=np.float32)
         self.flat_vertex_list = self.flat_program.vertex_list_indexed(
             len(solver.positions),
             GL_TRIANGLES,
             indices,
             position=("f", positions),
+            highlight=("f", highlight),
         )
         self.boundary_vertex_list = self.flat_program.vertex_list_indexed(
             len(solver.positions),
             GL_LINE_LOOP,
             solver.disk.boundary.astype(np.uint32, copy=False),
             position=("f", positions),
+            highlight=("f", highlight),
         )
 
     def _sync_flat_positions(self, positions: np.ndarray | None = None) -> None:
@@ -379,6 +389,18 @@ class STLViewer(pyglet.window.Window):
         flattened = source.astype(np.float32, copy=False).reshape(-1)
         self.flat_vertex_list.position[:] = flattened
         self.boundary_vertex_list.position[:] = flattened
+
+    def _sync_layer_highlight(self, progress: float | None) -> None:
+        if self.solver is None or self.flat_vertex_list is None:
+            return
+        if progress is None:
+            weights = np.zeros(len(self.solver.positions), dtype=np.float32)
+        else:
+            weights = self.solver.layer_highlight(
+                progress, LAYER_HIGHLIGHT_THICKNESS
+            ).astype(np.float32)
+        self.flat_vertex_list.highlight[:] = weights
+        self.boundary_vertex_list.highlight[:] = weights
 
     def _return_to_3d(self) -> None:
         self.mode = "3d"
@@ -426,33 +448,11 @@ class STLViewer(pyglet.window.Window):
         if self.timeline_time <= self.flatten_duration:
             self.mode = "flattening"
             progress = self.timeline_time / self.flatten_duration
-            layer_start = (1.0 - self.solver.flatten_layer) * (
-                1.0 - FLATTEN_LAYER_BLEND
-            )
-            layer_progress = np.clip(
-                (progress - layer_start) / FLATTEN_LAYER_BLEND, 0.0, 1.0
-            )
-            eased = (
-                layer_progress
-                * layer_progress
-                * (3.0 - 2.0 * layer_progress)
-            )[:, None]
-            expansion = progress * progress * (3.0 - 2.0 * progress)
-            circle_scale = (
-                FLATTEN_START_SCALE + (1.0 - FLATTEN_START_SCALE) * expansion
-            )
-            sweep_height = (1.0 - progress) * self.solver.flatten_max_z
-            flat_target = np.column_stack(
-                (
-                    self.solver.initial_positions * circle_scale,
-                    np.full(len(self.solver.positions), sweep_height),
-                )
-            )
-            positions = (
-                (1.0 - eased) * self.solver.flatten_start_positions
-                + eased * flat_target
+            positions = self.solver.flatten_frame(
+                progress, FLATTEN_LAYER_BLEND, FLATTEN_START_SCALE
             )
             self._sync_flat_positions(positions)
+            self._sync_layer_highlight(progress)
             self.status_message = (
                 f"Z-sweep flattening{self.flatten_note}... "
                 f"{round(progress * 100):d}%"
@@ -463,6 +463,7 @@ class STLViewer(pyglet.window.Window):
             ) * BOUNCE_SPEED
             self.solver.set_animation_time(solver_time)
             self._sync_flat_positions()
+            self._sync_layer_highlight(None)
             if self.solver.settled:
                 self.mode = "flat"
                 self.playing = False
@@ -636,6 +637,7 @@ class STLViewer(pyglet.window.Window):
         self.flat_program["rotation_y"] = math.radians(self.flat_rot_y)
         self.flat_program["zoom"] = self.flat_zoom
         self.flat_program["view_offset"] = (self.flat_pan_x, self.flat_pan_y)
+        self.flat_program["highlight_color"] = (1.0, 0.88, 0.15, 1.0)
         self.flat_program["color"] = (0.07, 0.25, 0.42, 1.0)
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
         self.flat_vertex_list.draw(GL_TRIANGLES)

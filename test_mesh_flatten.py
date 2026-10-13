@@ -116,6 +116,28 @@ class MeshFlattenTests(unittest.TestCase):
         solver.set_animation_time(0.0)
         np.testing.assert_allclose(solver.positions, solver.initial_positions)
 
+    def test_cut_tears_open_from_the_top(self):
+        solver = SpringEmbedding(self.disk, np.random.default_rng(5))
+        closed = solver.flatten_frame(0.0, 0.10, 0.72)
+        opened = solver.flatten_frame(0.35, 0.10, 0.72)
+        finished = solver.flatten_frame(1.0, 0.10, 0.72)
+        np.testing.assert_allclose(closed, solver.flatten_start_positions, atol=1e-8)
+        np.testing.assert_allclose(finished[:, :2], solver.initial_positions, atol=1e-8)
+        np.testing.assert_allclose(finished[:, 2], 0.0, atol=1e-8)
+
+        shift = np.linalg.norm(opened[:, :2] - closed[:, :2], axis=1)
+        top_shift = shift[solver.flatten_layer > 0.85].mean()
+        bottom_shift = shift[solver.flatten_layer < 0.4].mean()
+        self.assertGreater(top_shift, 0.2)
+        self.assertEqual(bottom_shift, 0.0)
+        target_z = float(np.median(solver.flatten_start_positions[:, 2]))
+        progress = 1.0 - target_z / solver.flatten_max_z
+        highlight = solver.layer_highlight(progress, 0.08)
+        nearest = int(np.argmin(np.abs(solver.flatten_start_positions[:, 2] - target_z)))
+        base = int(np.argmin(solver.flatten_start_positions[:, 2]))
+        self.assertEqual(highlight[nearest], 1.0)
+        self.assertEqual(highlight[base], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

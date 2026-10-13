@@ -461,12 +461,63 @@ class SpringEmbedding:
         stretch[disk.boundary] = self.boundary_positions
         self.positions[:] = stretch
         self.initial_positions = stretch.copy()
+        self._prepare_tear()
         self.bounce_frequency = self.rng.uniform(
             2.2, 3.2, (len(self.positions), 1)
         )
         self.energy = float("inf")
         self.settled = len(self.interior) == 0
         self.elapsed = 0.0
+
+    def _prepare_tear(self) -> None:
+        """Cache the cylindrical opening from the closed STL to the cut disk."""
+        start_xy = self.flatten_start_positions[:, :2]
+        target_xy = self.initial_positions
+        self.tear_start_radius = np.linalg.norm(start_xy, axis=1)
+        self.tear_target_radius = np.linalg.norm(target_xy, axis=1)
+        self.tear_start_angle = np.arctan2(start_xy[:, 1], start_xy[:, 0])
+        self.tear_target_angle = np.arctan2(target_xy[:, 1], target_xy[:, 0])
+        stable_start = self.tear_start_radius >= 1e-6
+        self.tear_start_angle = np.where(
+            stable_start, self.tear_start_angle, self.tear_target_angle
+        )
+        delta = self.tear_target_angle - self.tear_start_angle
+        self.tear_angle_delta = (delta + np.pi) % (2.0 * np.pi) - np.pi
+
+    def flatten_frame(
+        self, progress: float, layer_blend: float, start_scale: float
+    ) -> FloatArray:
+        """Open the cut from maximum Z downward, then stretch that layer outward."""
+        progress = float(np.clip(progress, 0.0, 1.0))
+        layer_blend = float(np.clip(layer_blend, 1e-4, 1.0))
+        layer_start = (1.0 - self.flatten_layer) * (1.0 - layer_blend)
+        layer_progress = np.clip((progress - layer_start) / layer_blend, 0.0, 1.0)
+        opened = layer_progress * layer_progress * (3.0 - 2.0 * layer_progress)
+        # The cut boundary swings open ahead of the surrounding surface.
+        lip_progress = np.clip(layer_progress * 2.4, 0.0, 1.0)
+        lip = lip_progress * lip_progress * (3.0 - 2.0 * lip_progress)
+        opened_amount = np.where(self.boundary_mask, lip, opened)
+        expansion = progress * progress * (3.0 - 2.0 * progress)
+        circle_scale = start_scale + (1.0 - start_scale) * expansion
+        angle = self.tear_start_angle + opened_amount * self.tear_angle_delta
+        radius = (1.0 - opened_amount) * self.tear_start_radius + opened_amount * (
+            self.tear_target_radius * circle_scale
+        )
+        sweep_height = (1.0 - progress) * self.flatten_max_z
+        height = (1.0 - opened_amount) * self.flatten_start_positions[:, 2] + (
+            opened_amount * sweep_height
+        )
+        return np.column_stack(
+            (radius * np.cos(angle), radius * np.sin(angle), height)
+        )
+
+    def layer_highlight(self, progress: float, thickness: float) -> FloatArray:
+        """Return 1 on the original-Z slice the sweep is about to flatten."""
+        progress = float(np.clip(progress, 0.0, 1.0))
+        sweep_height = (1.0 - progress) * self.flatten_max_z
+        band = max(float(thickness), 1e-4) * max(self.flatten_max_z, 1e-6)
+        distance = np.abs(self.flatten_start_positions[:, 2] - sweep_height)
+        return np.clip(1.0 - distance / band, 0.0, 1.0)
 
     def reset_animation(self) -> None:
         """Restore the pre-relaxation state so the full animation can replay."""
